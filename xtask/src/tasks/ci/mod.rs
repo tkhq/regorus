@@ -391,6 +391,8 @@ fn check_feature_combinations(workspace: &Path, release: bool, frozen: bool) -> 
         "std,arc,full-opa,allocator-memory-limits",
         // no_std codepath: exercises spin_no_std + absence of std deps.
         "arc,opa-no-std",
+        // no_std RVM path: exercises the alloc-only compiler and serialization stack.
+        "opa-no-std,rvm",
         // Cherry-picked builtins: popular features without full-opa to
         // ensure individual feature gates compose correctly.
         "std,arc,rvm,coverage,cache,regex,time",

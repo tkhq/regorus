@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(rvm)* [**breaking**] Use the deterministic, `no_std`-compatible `EntryPointMap` type for program entry points and enforce load limits.
+
 ## [0.12.0](https://github.com/microsoft/regorus/compare/regorus-v0.11.0...regorus-v0.12.0) - 2026-09-01
 
 ### Added

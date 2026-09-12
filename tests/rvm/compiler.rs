@@ -51,6 +51,84 @@ fn assert_literal_exists(program: &regorus::rvm::program::Program, expected: &Va
 }
 
 #[test]
+fn entry_point_order_is_stable_across_serialization() {
+    use regorus::rvm::program::{DeserializationResult, Program};
+
+    let mut first = Program::new();
+    first.add_entry_point("data.test.z".to_string(), 2);
+    first.add_entry_point("data.test.a".to_string(), 1);
+
+    let mut second = Program::new();
+    second.add_entry_point("data.test.z".to_string(), 2);
+    second.add_entry_point("data.test.a".to_string(), 1);
+
+    let first_binary = first.serialize_binary().unwrap();
+    assert_eq!(first_binary, second.serialize_binary().unwrap());
+
+    let decoded = match Program::deserialize_binary(&first_binary).unwrap() {
+        DeserializationResult::Complete(program) => program,
+        DeserializationResult::Partial(_) => panic!("entry point program decoded partially"),
+    };
+    assert_eq!(decoded.serialize_binary().unwrap(), first_binary);
+    assert_eq!(
+        decoded
+            .get_entry_points()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["data.test.z", "data.test.a"]
+    );
+
+    let first_json = first.serialize_json().unwrap();
+    assert_eq!(first_json, second.serialize_json().unwrap());
+    let decoded_json = Program::deserialize_json(&first_json).unwrap();
+    assert_eq!(decoded_json.serialize_json().unwrap(), first_json);
+}
+
+fn oversized_entry_point_program() -> regorus::rvm::program::Program {
+    use regorus::rvm::program::Program;
+
+    let mut program = Program::new();
+    for index in 0..=Program::MAX_ENTRY_POINTS {
+        program.add_entry_point(format!("data.test.entry_{index}"), index);
+    }
+    program
+}
+
+#[test]
+fn binary_deserialization_rejects_oversized_entry_point_map() {
+    let valid_binary = regorus::rvm::program::Program::new()
+        .serialize_binary()
+        .unwrap();
+    let oversized_entry_points =
+        postcard::to_allocvec(oversized_entry_point_program().get_entry_points()).unwrap();
+    let previous_len =
+        usize::try_from(u32::from_le_bytes(valid_binary[8..12].try_into().unwrap())).unwrap();
+    let remaining_sections = 25 + previous_len;
+
+    let mut oversized_binary = Vec::new();
+    oversized_binary.extend_from_slice(&valid_binary[..8]);
+    oversized_binary.extend_from_slice(
+        &u32::try_from(oversized_entry_points.len())
+            .unwrap()
+            .to_le_bytes(),
+    );
+    oversized_binary.extend_from_slice(&valid_binary[12..25]);
+    oversized_binary.extend_from_slice(&oversized_entry_points);
+    oversized_binary.extend_from_slice(&valid_binary[remaining_sections..]);
+
+    let error = regorus::rvm::program::Program::deserialize_binary(&oversized_binary).unwrap_err();
+    assert!(error.contains("Program exceeds max entry points"));
+}
+
+#[test]
+fn json_deserialization_rejects_oversized_entry_point_map() {
+    let oversized_json = oversized_entry_point_program().serialize_json().unwrap();
+    let error = regorus::rvm::program::Program::deserialize_json(&oversized_json).unwrap_err();
+    assert!(error.contains("Program exceeds max entry points"));
+}
+
+#[test]
 fn constant_array_is_hoisted() {
     let program = compile_rule(
         r#"
