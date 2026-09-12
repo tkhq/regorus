@@ -366,7 +366,8 @@ impl Interpreter {
                     }
                     continue;
                 }
-                Value::Null | Value::Bool(_) | Value::Number(_) | Value::Undefined => 1,
+                Value::Number(number) => 1_u64.saturating_add(number.magnitude_byte_len()),
+                Value::Null | Value::Bool(_) | Value::Undefined => 1,
             };
             self.consume_semantic_work_n(units)?;
             total = total.saturating_add(units);
@@ -407,24 +408,6 @@ impl Interpreter {
             .unwrap_or(u64::MAX)
             .saturating_add(1);
         1_u64.saturating_add(elements.saturating_mul(2))
-    }
-
-    fn string_repeat_projection(args: &[Value]) -> u64 {
-        let length = args
-            .first()
-            .and_then(|value| match value {
-                Value::String(value) => Some(u64::try_from(value.len()).unwrap_or(u64::MAX)),
-                _ => None,
-            })
-            .unwrap_or(0);
-        let count = args
-            .get(1)
-            .and_then(|value| match value {
-                Value::Number(value) => value.as_u64(),
-                _ => None,
-            })
-            .unwrap_or(0);
-        1_u64.saturating_add(length.saturating_mul(count))
     }
 
     fn cidr_expand_projection(args: &[Value]) -> u64 {
@@ -493,24 +476,140 @@ impl Interpreter {
             .saturating_add(input.saturating_mul(replacement.saturating_add(1)))
     }
 
+    fn shift_projection(args: &[Value]) -> u64 {
+        let value_bytes = args
+            .first()
+            .and_then(|value| match value {
+                Value::Number(number) => Some(number.magnitude_byte_len()),
+                _ => None,
+            })
+            .unwrap_or(1);
+        let shift = args
+            .get(1)
+            .and_then(|value| match value {
+                Value::Number(number) => number.as_u64(),
+                _ => None,
+            })
+            .unwrap_or(u64::MAX);
+        value_bytes.saturating_add(shift.saturating_add(7).checked_div(8).unwrap_or(u64::MAX))
+    }
+
+    fn number_format_projection(args: &[Value]) -> u64 {
+        let Some(Value::Number(number)) = args.first() else {
+            return 1;
+        };
+        let bytes = number.magnitude_byte_len();
+        let bits = bytes.saturating_mul(8);
+        let digits = match args.get(1) {
+            Some(Value::Number(base)) => match base.as_u64() {
+                Some(2) => bits,
+                Some(8) => bits.saturating_add(2).checked_div(3).unwrap_or(u64::MAX),
+                Some(10) => bits
+                    .saturating_mul(30103)
+                    .saturating_add(99999)
+                    .checked_div(100000)
+                    .unwrap_or(u64::MAX),
+                Some(16) => bits.saturating_add(3).checked_div(4).unwrap_or(u64::MAX),
+                _ => 1,
+            },
+            _ => 1,
+        };
+        bytes
+            .saturating_mul(bytes)
+            .saturating_add(digits)
+            .saturating_add(1)
+    }
+
+    fn decimal_exponent_projection(args: &[Value], linear: u64) -> u64 {
+        let exponent = args
+            .first()
+            .and_then(|value| match value {
+                Value::String(value) => value.rsplit_once(['e', 'E']).map(|(_, exponent)| exponent),
+                _ => None,
+            })
+            .map(|exponent| {
+                let digits = exponent
+                    .strip_prefix(['+', '-'])
+                    .unwrap_or(exponent)
+                    .bytes()
+                    .take_while(u8::is_ascii_digit);
+                digits.fold(0_u64, |value, digit| {
+                    value
+                        .saturating_mul(10)
+                        .saturating_add(u64::from(digit.saturating_sub(b'0')))
+                })
+            })
+            .unwrap_or(0);
+        linear.saturating_mul(linear).saturating_add(exponent)
+    }
+
+    fn sprintf_projection(args: &[Value], linear: u64) -> u64 {
+        let Some(Value::String(format)) = args.first() else {
+            return linear;
+        };
+        let bytes = format.as_bytes();
+        let mut index = 0;
+        let mut expansion = 0_u64;
+        while index < bytes.len() {
+            if bytes.get(index) != Some(&b'%') {
+                index = index.saturating_add(1);
+                continue;
+            }
+            index = index.saturating_add(1);
+            if bytes.get(index) == Some(&b'%') {
+                index = index.saturating_add(1);
+                continue;
+            }
+            if bytes.get(index) == Some(&b'.') {
+                index = index.saturating_add(1);
+            }
+            let mut width = 0_u64;
+            while let Some(digit) = bytes.get(index).and_then(|byte| byte.checked_sub(b'0')) {
+                if digit > 9 {
+                    break;
+                }
+                width = width.saturating_mul(10).saturating_add(u64::from(digit));
+                index = index.saturating_add(1);
+            }
+            expansion = expansion.saturating_add(width);
+            index = index.saturating_add(1);
+        }
+        linear.saturating_mul(linear).saturating_add(expansion)
+    }
+
+    fn arithmetic_projection(op: &ArithOp, lhs: &Value, rhs: &Value) -> u64 {
+        let (Value::Number(lhs), Value::Number(rhs)) = (lhs, rhs) else {
+            return 1;
+        };
+        let lhs = lhs.magnitude_byte_len();
+        let rhs = rhs.magnitude_byte_len();
+        match op {
+            ArithOp::Add | ArithOp::Sub => lhs.max(rhs).saturating_add(1),
+            ArithOp::Mul | ArithOp::Div | ArithOp::Mod => lhs
+                .saturating_mul(rhs)
+                .saturating_add(lhs)
+                .saturating_add(rhs),
+        }
+    }
+
     fn builtin_work_projection(name: &str, args: &[Value], argument_work: u64) -> Option<u64> {
         let linear = argument_work.max(1);
         let quadratic = linear.saturating_mul(linear);
         Some(match name {
             "numbers.range" => Self::range_projection(args, None),
             "numbers.range_step" => Self::range_projection(args, Some(2)),
-            "strings.repeat" => Self::string_repeat_projection(args),
             "net.cidr_expand" => Self::cidr_expand_projection(args),
             "azure.policy.fn.range" => Self::azure_range_projection(args),
             "azure.policy.fn.pad_left" => Self::azure_pad_left_projection(args),
             "replace" | "regex.replace" => Self::replacement_projection(args),
             "split" | "regex.split" | "azure.policy.fn.split" => linear.saturating_mul(2),
-            "concat"
-            | "array.concat"
-            | "azure.policy.fn.join"
-            | "sprintf"
-            | "format_int"
-            | "azure.policy.fn.format" => quadratic,
+            "sprintf" => Self::sprintf_projection(args, linear),
+            "format_int" => Self::number_format_projection(args),
+            "bits.lsh" | "bits.rsh" => Self::shift_projection(args),
+            "to_number" | "units.parse" | "units.parse_bytes" => {
+                Self::decimal_exponent_projection(args, linear)
+            }
+            "concat" | "array.concat" | "azure.policy.fn.join" => quadratic,
             "base64.decode"
             | "base64.encode"
             | "base64url.decode"
@@ -523,13 +622,10 @@ impl Interpreter {
             | "urlquery.encode"
             | "urlquery.encode_object"
             | "json.marshal"
-            | "json.unmarshal"
             | "azure.policy.fn.base64"
-            | "azure.policy.fn.base64_to_json"
             | "azure.policy.fn.base64_to_string"
             | "azure.policy.fn.data_uri"
             | "azure.policy.fn.data_uri_to_string"
-            | "azure.policy.fn.json"
             | "azure.policy.fn.string"
             | "azure.policy.fn.uri"
             | "azure.policy.fn.uri_component"
@@ -544,7 +640,6 @@ impl Interpreter {
             | "object.remove"
             | "object.union"
             | "object.union_n"
-            | "json.filter"
             | "json.patch"
             | "json.remove"
             | "sort"
@@ -569,10 +664,8 @@ impl Interpreter {
             | "product"
             | "sum"
             | "bits.and"
-            | "bits.lsh"
             | "bits.negate"
             | "bits.or"
-            | "bits.rsh"
             | "bits.xor"
             | "contains"
             | "endswith"
@@ -586,7 +679,6 @@ impl Interpreter {
             | "is_object"
             | "is_set"
             | "is_string"
-            | "json.is_valid"
             | "lower"
             | "net.cidr_contains"
             | "net.cidr_is_valid"
@@ -604,7 +696,6 @@ impl Interpreter {
             | "strings.count"
             | "strings.reverse"
             | "substring"
-            | "to_number"
             | "trace"
             | "trim"
             | "trim_left"
@@ -613,8 +704,6 @@ impl Interpreter {
             | "trim_space"
             | "trim_suffix"
             | "type_name"
-            | "units.parse"
-            | "units.parse_bytes"
             | "upper"
             | "uuid.parse"
             | "base64.is_valid"
@@ -1052,6 +1141,13 @@ impl Interpreter {
 
         if lhs_value == Value::Undefined || rhs_value == Value::Undefined {
             return Ok(Value::Undefined);
+        }
+
+        if !matches!(
+            (op, &lhs_value, &rhs_value),
+            (ArithOp::Sub, Value::Set(_), _) | (ArithOp::Sub, _, Value::Set(_))
+        ) {
+            self.consume_semantic_work_n(Self::arithmetic_projection(op, &lhs_value, &rhs_value))?;
         }
 
         match (op, &lhs_value, &rhs_value) {

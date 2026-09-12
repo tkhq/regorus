@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use alloc::boxed::Box;
+use alloc::format;
 use alloc::string::ToString as _;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
@@ -85,13 +86,8 @@ answer := middle(input.value)
 
     assert_eq!(budget_error(&second), first_error);
     assert_eq!(engine.evaluation_metrics(), first_metrics);
-    assert_eq!(
-        first_error,
-        EvaluationBudgetError {
-            consumed: limit.saturating_add(1),
-            limit,
-        }
-    );
+    assert_eq!(first_error.limit, limit);
+    assert!(first_error.consumed > limit);
     Ok(())
 }
 
@@ -168,24 +164,120 @@ answer := count(numbers.range(0, 10000000))
     Ok(())
 }
 
+#[cfg(feature = "net")]
 #[test]
-fn string_repeat_expansion_is_rejected_before_dispatch() -> Result<()> {
+fn cidr_expansion_is_rejected_before_dispatch() -> Result<()> {
     let mut engine = engine_with_policy(
         r#"
 package budget
 
-answer := strings.repeat("x", 10000000)
+answer := count(net.cidr_expand("10.0.0.0/8"))
 "#,
     )?;
     engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 50 });
 
     let error = engine
         .eval_rule("data.budget.answer".to_string())
-        .expect_err("string repetition must exceed the preflight budget");
+        .expect_err("CIDR expansion must exceed the preflight budget");
     let error = budget_error(&error);
 
     assert_eq!(error.limit, 50);
     assert!(error.consumed > error.limit);
+    Ok(())
+}
+
+#[test]
+fn huge_bit_shifts_are_rejected_before_dispatch() -> Result<()> {
+    for operation in ["bits.lsh", "bits.rsh"] {
+        let policy = format!(
+            r#"
+package budget
+
+answer := {operation}(1, 2000000000)
+"#
+        );
+        let mut engine = engine_with_policy(&policy)?;
+        engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 1_000 });
+
+        let error = engine
+            .eval_rule("data.budget.answer".to_string())
+            .expect_err("a huge shift must exceed the preflight budget");
+        assert_eq!(budget_error(&error).limit, 1_000);
+    }
+    Ok(())
+}
+
+#[test]
+fn bigint_arithmetic_and_decimal_pow_are_precharged() -> Result<()> {
+    let mut multiply = engine_with_policy(
+        r#"
+package budget
+
+answer := 1234567890123456789012345678901234567890 * 9876543210987654321098765432109876543210
+"#,
+    )?;
+    multiply.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 100 });
+    let first = multiply
+        .eval_rule("data.budget.answer".to_string())
+        .expect_err("BigInt multiplication must be precharged");
+    let second = multiply
+        .eval_rule("data.budget.answer".to_string())
+        .expect_err("BigInt multiplication accounting must repeat");
+    assert_eq!(budget_error(&first), budget_error(&second));
+
+    for call in [
+        r#"units.parse("1e2000000000")"#,
+        r#"units.parse("1e2000000000K")"#,
+        r#"to_number("1e2000000000")"#,
+    ] {
+        let policy = format!("package budget\nanswer := {call}\n");
+        let mut engine = engine_with_policy(&policy)?;
+        engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 1_000 });
+        let error = engine
+            .eval_rule("data.budget.answer".to_string())
+            .expect_err("decimal exponentiation must be rejected before dispatch");
+        assert_eq!(budget_error(&error).limit, 1_000);
+    }
+    Ok(())
+}
+
+#[test]
+fn sprintf_width_and_precision_are_rejected_before_dispatch() -> Result<()> {
+    for format in ["%200000000d", "%0200000000d", "%.200000000f"] {
+        let policy = format!(
+            r#"
+package budget
+
+answer := sprintf("{format}", [1])
+"#
+        );
+        let mut engine = engine_with_policy(&policy)?;
+        engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 1_000 });
+        let error = engine
+            .eval_rule("data.budget.answer".to_string())
+            .expect_err("sprintf expansion must be rejected before dispatch");
+        assert_eq!(budget_error(&error).limit, 1_000);
+    }
+    Ok(())
+}
+
+#[test]
+fn format_int_bigint_output_is_precharged() -> Result<()> {
+    let mut engine = engine_with_policy(
+        r#"
+package budget
+
+answer := format_int(1234567890123456789012345678901234567890, input)
+"#,
+    )?;
+    engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 100 });
+    for base in [2, 8, 10, 16] {
+        engine.set_input(Value::from(base));
+        let error = engine
+            .eval_rule("data.budget.answer".to_string())
+            .expect_err("BigInt formatting must exceed the preflight budget");
+        assert_eq!(budget_error(&error).limit, 100);
+    }
     Ok(())
 }
 
@@ -220,6 +312,44 @@ answer := count(input)
 
     assert!(long_string > short_string);
     assert!(long_array > short_array);
+    Ok(())
+}
+
+#[test]
+fn bigint_magnitude_increases_structural_work() -> Result<()> {
+    let mut small_engine =
+        engine_with_policy("package budget\nanswer := count([18446744073709551616])\n")?;
+    small_engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 100_000 });
+    small_engine.eval_rule("data.budget.answer".to_string())?;
+    let small = small_engine.evaluation_metrics().consumed;
+
+    let mut large_engine = engine_with_policy(
+        "package budget\nanswer := count([340282366920938463463374607431768211456])\n",
+    )?;
+    large_engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 100_000 });
+    large_engine.eval_rule("data.budget.answer".to_string())?;
+    let large = large_engine.evaluation_metrics().consumed;
+
+    assert!(large > small);
+    Ok(())
+}
+
+#[test]
+fn unsafe_numeric_deserializers_are_default_denied() -> Result<()> {
+    for call in [
+        r#"json.unmarshal("1e2000000000")"#,
+        r#"json.is_valid("1e2000000000")"#,
+    ] {
+        let policy = format!("package budget\nanswer := {call}\n");
+        let mut engine = engine_with_policy(&policy)?;
+        engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 1_000 });
+        let error = engine
+            .eval_rule("data.budget.answer".to_string())
+            .expect_err("an unbounded numeric deserializer must be denied");
+        assert!(error
+            .to_string()
+            .contains("has no deterministic work estimator"));
+    }
     Ok(())
 }
 

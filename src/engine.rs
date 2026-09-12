@@ -156,8 +156,10 @@ impl Engine {
     /// dispatch, queries and rule bodies, rule and function calls, builtin and extension
     /// calls, compound-expression helpers, collection assembly, each loop or comprehension
     /// iteration, each `with` modifier, and uncached virtual-document work. Builtins also
-    /// charge structural argument and result weights plus a preflight projection. A budgeted
-    /// builtin or extension without a declared estimator is rejected before dispatch. Compound
+    /// charge structural argument and result weights plus a preflight projection. Number weights
+    /// include binary magnitude bytes, and arithmetic is precharged from operand magnitudes.
+    /// A budgeted builtin or extension without a declared estimator is rejected before dispatch.
+    /// Compound
     /// and nested operations reach multiple checkpoints and share one top-level budget. The
     /// budget is reset before each [`eval_query`](Self::eval_query),
     /// [`eval_rule`](Self::eval_rule), or other top-level interpreter evaluation. It does

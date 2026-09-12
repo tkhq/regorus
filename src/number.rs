@@ -67,6 +67,23 @@ pub enum Number {
 
 #[verus_verify]
 impl Number {
+    /// Number of bytes needed to represent this number's magnitude.
+    ///
+    /// Integer magnitudes use their significant binary bytes, including one byte for zero.
+    /// Floating-point values use their fixed eight-byte representation.
+    pub(crate) fn magnitude_byte_len(&self) -> u64 {
+        match self {
+            Number::UInt(value) => {
+                u64::from((u64::BITS - value.leading_zeros()).max(1)).div_ceil(8)
+            }
+            Number::Int(value) => {
+                u64::from((u64::BITS - value.unsigned_abs().leading_zeros()).max(1)).div_ceil(8)
+            }
+            Number::Float(_) => 8,
+            Number::BigInt(value) => value.bits().max(1).div_ceil(8),
+        }
+    }
+
     #[verus_spec(result =>
         ensures
             result@ == NumberView::Integer(value@),

@@ -5,11 +5,13 @@ use core::fmt;
 
 /// Version of the deterministic evaluation-work accounting contract.
 ///
-/// Version 1 charges one unit for scalar values, one plus the byte length for strings,
-/// one plus the element count plus child weights for arrays and sets, and one plus twice
-/// the entry count plus key and value weights for objects. Builtins also charge argument
-/// weights, a declared preflight projection, and the actual result weight. A budgeted call
-/// is rejected before dispatch when its builtin or extension has no declared estimator.
+/// Version 1 charges one unit for scalar values, plus a number's binary magnitude bytes or a
+/// string's UTF-8 bytes. It charges one plus the element count plus child weights for arrays and
+/// sets, and one plus twice the entry count plus key and value weights for objects. Builtins also
+/// charge argument weights, a declared preflight projection, and the actual result weight.
+/// Arithmetic charges a magnitude-based projection before evaluation. A budgeted call is rejected
+/// before dispatch when its builtin or extension has no declared estimator. Version 1 describes
+/// the unreleased accounting contract and can change until its first release.
 pub const EVALUATION_ACCOUNTING_VERSION: u32 = 1;
 
 /// Configuration for deterministic interpreter evaluation budgeting.
