@@ -30,6 +30,8 @@ use timer_test_support::{
     apply_engine_timer, configure_time_source, reset_time_source, GlobalTimerGuard,
 };
 
+mod budget;
+
 mod timer_test_support {
     use super::{ExecutionTimerTestConfig, TimeSourceTestConfig};
     #[cfg(any(test, not(feature = "std")))]

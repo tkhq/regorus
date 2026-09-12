@@ -10,7 +10,10 @@ use crate::parser::*;
 use crate::scheduler::*;
 use crate::utils::gather_functions;
 use crate::utils::limits::PolicyLengthConfig;
-use crate::utils::limits::{self, fallback_execution_timer_config, ExecutionTimerConfig};
+use crate::utils::limits::{
+    self, fallback_execution_timer_config, EvaluationBudgetConfig, EvaluationMetrics,
+    ExecutionTimerConfig,
+};
 use crate::value::*;
 use crate::*;
 use crate::{Extension, QueryResults};
@@ -145,6 +148,35 @@ impl Engine {
     pub fn set_execution_timer_config(&mut self, config: ExecutionTimerConfig) {
         self.execution_timer_config = Some(config);
         self.interpreter.set_execution_timer_config(Some(config));
+    }
+
+    /// Configure a deterministic semantic-work budget for interpreter evaluations.
+    ///
+    /// Units are consumed at deterministic semantic checkpoints: expression and statement
+    /// dispatch, queries and rule bodies, rule and function calls, builtin and extension
+    /// calls, compound-expression helpers, collection assembly, each loop or comprehension
+    /// iteration, each `with` modifier, and uncached virtual-document work. Compound and
+    /// nested operations reach multiple checkpoints and share one top-level budget. The
+    /// budget is reset before each [`eval_query`](Self::eval_query),
+    /// [`eval_rule`](Self::eval_rule), or other top-level interpreter evaluation. It does
+    /// not read or depend on a clock.
+    ///
+    /// Exceeding the limit returns
+    /// [`EvaluationBudgetError`](crate::utils::limits::EvaluationBudgetError).
+    /// With no configured budget, evaluation behavior is unchanged, while metrics are still
+    /// collected.
+    pub const fn set_evaluation_budget_config(&mut self, config: EvaluationBudgetConfig) {
+        self.interpreter.set_evaluation_budget_config(Some(config));
+    }
+
+    /// Disable deterministic evaluation budgeting while retaining work metrics.
+    pub const fn clear_evaluation_budget_config(&mut self) {
+        self.interpreter.set_evaluation_budget_config(None);
+    }
+
+    /// Return semantic work consumed by the most recently started top-level evaluation.
+    pub const fn evaluation_metrics(&self) -> EvaluationMetrics {
+        self.interpreter.evaluation_metrics()
     }
 
     /// Set the policy length limits used when loading policies.
@@ -1120,6 +1152,7 @@ impl Engine {
 
     #[doc(hidden)]
     fn prepare_for_eval(&mut self, enable_tracing: bool, for_target: bool) -> Result<()> {
+        self.interpreter.pause_evaluation_budget();
         // Fail fast if the engine already exceeds the global memory limit before evaluation work.
         limits::enforce_memory_limit().map_err(|err| anyhow!(err))?;
 

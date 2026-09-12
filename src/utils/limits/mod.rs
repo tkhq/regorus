@@ -5,12 +5,15 @@
 
 #![allow(dead_code)]
 
+mod budget;
 mod error;
 mod length;
 #[cfg(all(feature = "allocator-memory-limits", not(miri)))]
 mod memory;
 mod time;
 
+pub(crate) use budget::EvaluationBudget;
+pub use budget::{EvaluationBudgetConfig, EvaluationBudgetError, EvaluationMetrics};
 #[allow(unused_imports)]
 pub use error::LimitError;
 

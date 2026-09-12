@@ -15,7 +15,10 @@ use crate::lexer::*;
 use crate::lookup::Lookup;
 use crate::parser::Parser;
 use crate::scheduler::*;
-use crate::utils::limits::{monotonic_now, ExecutionTimer, ExecutionTimerConfig};
+use crate::utils::limits::{
+    monotonic_now, EvaluationBudget, EvaluationBudgetConfig, EvaluationMetrics, ExecutionTimer,
+    ExecutionTimerConfig,
+};
 #[cfg(feature = "std")]
 use crate::utils::*;
 #[cfg(not(feature = "std"))]
@@ -112,6 +115,7 @@ pub struct Interpreter {
     builtins_cache: BTreeMap<(&'static str, Vec<Value>), Value>,
     no_rules_lookup: bool,
     execution_timer: ExecutionTimer,
+    evaluation_budget: EvaluationBudget,
 }
 
 impl Default for Interpreter {
@@ -160,6 +164,7 @@ impl Clone for Interpreter {
             module: None,
             no_rules_lookup: false,
             execution_timer: ExecutionTimer::new(self.execution_timer.config()),
+            evaluation_budget: EvaluationBudget::new(self.evaluation_budget.config()),
         }
     }
 }
@@ -241,6 +246,7 @@ impl Interpreter {
             gather_prints: false,
             prints: Vec::default(),
             execution_timer: ExecutionTimer::new(None),
+            evaluation_budget: EvaluationBudget::new(None),
         }
     }
 
@@ -285,6 +291,7 @@ impl Interpreter {
                 .clone()
                 .unwrap_or_else(Value::new_object),
             execution_timer: ExecutionTimer::new(None),
+            evaluation_budget: EvaluationBudget::new(None),
         }
     }
 
@@ -312,8 +319,33 @@ impl Interpreter {
     }
 
     #[inline]
+    fn consume_semantic_work(&mut self) -> Result<()> {
+        self.evaluation_budget.consume().map_err(anyhow::Error::new)
+    }
+
+    #[inline]
     fn check_execution_time(&mut self) -> Result<()> {
         self.execution_timer_tick(1)
+    }
+
+    #[inline]
+    fn check_execution_limits(&mut self) -> Result<()> {
+        self.check_execution_time()?;
+        self.consume_semantic_work()
+    }
+
+    fn propagate_budget_error<T>(result: Result<T>) -> Result<Option<T>> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(error)
+                if error
+                    .downcast_ref::<crate::EvaluationBudgetError>()
+                    .is_some() =>
+            {
+                Err(error)
+            }
+            Err(_) => Ok(None),
+        }
     }
 
     fn compiled_policy_mut(&mut self) -> &mut CompiledPolicyData {
@@ -381,6 +413,18 @@ impl Interpreter {
         self.reset_execution_timer_state();
     }
 
+    pub const fn set_evaluation_budget_config(&mut self, config: Option<EvaluationBudgetConfig>) {
+        self.evaluation_budget = EvaluationBudget::new(config);
+    }
+
+    pub const fn evaluation_metrics(&self) -> EvaluationMetrics {
+        self.evaluation_budget.metrics()
+    }
+
+    pub const fn pause_evaluation_budget(&mut self) {
+        self.evaluation_budget.pause();
+    }
+
     pub fn set_input(&mut self, input: Value) {
         self.input = input.clone();
         // Update with_document["input"] too, in case if engine is being reused and was already prepared
@@ -410,6 +454,7 @@ impl Interpreter {
         self.rule_values.clear();
         self.builtins_cache.clear();
         self.reset_execution_timer_state();
+        self.evaluation_budget.reset();
     }
 
     #[cfg(all(feature = "allocator-memory-limits", not(miri)))]
@@ -693,7 +738,7 @@ impl Interpreter {
         domain: &ExprRef,
         query: &Ref<Query>,
     ) -> Result<bool> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         let domain = self.eval_expr(domain)?;
 
         self.scopes.push(Scope::new());
@@ -705,6 +750,7 @@ impl Interpreter {
         match domain {
             Value::Array(a) => {
                 for (idx, v) in a.iter().enumerate() {
+                    self.consume_semantic_work()?;
                     self.add_variable(&value.source_str(), v.clone())?;
                     if let Some(key) = key {
                         self.add_variable(&key.source_str(), Value::from(idx))?;
@@ -717,6 +763,7 @@ impl Interpreter {
             }
             Value::Set(s) => {
                 for v in s.iter() {
+                    self.consume_semantic_work()?;
                     self.add_variable(&value.source_str(), v.clone())?;
                     if let Some(key) = key {
                         self.add_variable(&key.source_str(), v.clone())?;
@@ -729,6 +776,7 @@ impl Interpreter {
             }
             Value::Object(o) => {
                 for (k, v) in o.iter() {
+                    self.consume_semantic_work()?;
                     self.add_variable(&value.source_str(), v.clone())?;
                     if let Some(key) = key {
                         self.add_variable(&key.source_str(), k.clone())?;
@@ -754,7 +802,7 @@ impl Interpreter {
         plan: &DestructuringPlan,
         value: &Value,
     ) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         if value == &Value::Undefined {
             return Ok(Value::Undefined);
         }
@@ -854,7 +902,7 @@ impl Interpreter {
     }
 
     fn execute_assignment_plan(&mut self, plan: &AssignmentPlan) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         match plan {
             AssignmentPlan::ColonEquals {
                 lhs_expr: _,
@@ -950,7 +998,7 @@ impl Interpreter {
         collection: &ExprRef,
         stmts: &[&LiteralStmt],
     ) -> Result<bool> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         let scope_saved = self.current_scope()?.clone();
         let mut count: usize = 0;
 
@@ -976,6 +1024,7 @@ impl Interpreter {
         match self.eval_expr(collection)? {
             Value::Array(a) => {
                 for (idx, value) in a.iter().enumerate() {
+                    self.consume_semantic_work()?;
                     *self.current_scope_mut()? = scope_saved.clone();
 
                     let mut success = if let Some(key_plan) = &key_plan {
@@ -1013,6 +1062,7 @@ impl Interpreter {
             }
             Value::Set(s) => {
                 for value in s.iter() {
+                    self.consume_semantic_work()?;
                     *self.current_scope_mut()? = scope_saved.clone();
 
                     let mut success = if let Some(key_plan) = &key_plan {
@@ -1050,6 +1100,7 @@ impl Interpreter {
 
             Value::Object(o) => {
                 for (key, value) in o.iter() {
+                    self.consume_semantic_work()?;
                     *self.current_scope_mut()? = scope_saved.clone();
 
                     let mut success = if let Some(key_plan) = &key_plan {
@@ -1239,7 +1290,7 @@ impl Interpreter {
         })
     }
 
-    fn apply_with_modifiers(&mut self, stmt: &LiteralStmt) -> Result<(Option<State>, bool)> {
+    fn apply_with_modifiers_impl(&mut self, stmt: &LiteralStmt) -> Result<(Option<State>, bool)> {
         if !stmt.with_mods.is_empty() {
             // Save state;
             let with_document = self.with_document.clone();
@@ -1257,6 +1308,7 @@ impl Interpreter {
             let mut skip_exec = false;
             // Apply with modifiers.
             for wm in &stmt.with_mods {
+                self.consume_semantic_work()?;
                 let path = Parser::get_path_ref_components(&wm.refr)?;
                 let mut path: Vec<String> = path.iter().map(|s| s.text().to_string()).collect();
 
@@ -1315,6 +1367,13 @@ impl Interpreter {
                             // Function replaced by value.
                             self.with_functions
                                 .insert(target, FunctionModifier::Value(v));
+                        }
+                        Err(error)
+                            if error
+                                .downcast_ref::<crate::EvaluationBudgetError>()
+                                .is_some() =>
+                        {
+                            return Err(error);
                         }
                         _ => {
                             // Function replaced by another function.
@@ -1392,6 +1451,30 @@ impl Interpreter {
         }
     }
 
+    fn apply_with_modifiers(&mut self, stmt: &LiteralStmt) -> Result<(Option<State>, bool)> {
+        let rollback = if stmt.with_mods.is_empty() {
+            None
+        } else {
+            Some((
+                self.with_document.clone(),
+                self.input.clone(),
+                self.data.clone(),
+                self.processed.clone(),
+                self.processed_paths.clone(),
+                self.with_functions.clone(),
+                self.rule_values.clone(),
+            ))
+        };
+
+        match self.apply_with_modifiers_impl(stmt) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                self.restore_state(rollback)?;
+                Err(error)
+            }
+        }
+    }
+
     fn restore_state(&mut self, saved_state: Option<State>) -> Result<()> {
         if let Some(s) = saved_state {
             (
@@ -1408,6 +1491,7 @@ impl Interpreter {
     }
 
     fn eval_stmt(&mut self, stmt: &LiteralStmt, stmts: &[&LiteralStmt]) -> Result<bool> {
+        self.consume_semantic_work()?;
         let (saved_state, skip_exec) = self.apply_with_modifiers(stmt)?;
         let r = if !skip_exec {
             self.eval_stmt_impl(stmt, stmts)
@@ -1433,7 +1517,7 @@ impl Interpreter {
         loops: &[HoistedLoop],
     ) -> Result<bool> {
         self.memory_check()?;
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         if loops.is_empty() {
             if let Some((first_stmt, tail_stmts)) = stmts.split_first() {
                 // Evaluate the current statement whose loop expressions have been hoisted.
@@ -1462,7 +1546,7 @@ impl Interpreter {
             let (saved_state, _) = self.apply_with_modifiers(first_stmt)?;
 
             let collection_expr = Self::loop_collection_expr(loop_info).clone();
-            let loop_value = if let Expr::Call {
+            let loop_value_result = if let Expr::Call {
                 span, fcn, params, ..
             } = collection_expr.as_ref()
             {
@@ -1481,14 +1565,15 @@ impl Interpreter {
                 } else {
                     params.as_slice()
                 };
-                self.eval_call_impl(span, &collection_expr, fcn, params_slice)?
+                self.eval_call_impl(span, &collection_expr, fcn, params_slice)
             } else {
-                self.eval_expr(&collection_expr)?
+                self.eval_expr(&collection_expr)
             };
 
             // Restore with modifiers.
             // TODO: Delay this restore so that the stmt doesn't have to apply with modifiers again.
             self.restore_state(saved_state)?;
+            let loop_value = loop_value_result?;
 
             // If the loop's index variable h<as already been assigned a value
             // (this can happen if the same index is used for two different collections),
@@ -1503,6 +1588,7 @@ impl Interpreter {
                 match loop_value {
                     Value::Array(items) => {
                         for item in items.iter() {
+                            self.consume_semantic_work()?;
                             self.memory_check()?;
                             self.set_loop_var_value(loop_target_expr, item.clone())?;
 
@@ -1583,6 +1669,7 @@ impl Interpreter {
             match loop_value {
                 Value::Array(items) => {
                     for (idx, v) in items.iter().enumerate() {
+                        self.consume_semantic_work()?;
                         self.memory_check()?;
                         self.set_loop_var_value(loop_target_expr, v.clone())?;
 
@@ -1605,6 +1692,7 @@ impl Interpreter {
                 }
                 Value::Set(items) => {
                     for v in items.iter() {
+                        self.consume_semantic_work()?;
                         self.memory_check()?;
                         self.set_loop_var_value(loop_target_expr, v.clone())?;
 
@@ -1625,6 +1713,7 @@ impl Interpreter {
                 }
                 Value::Object(obj) => {
                     for (k, v) in obj.iter() {
+                        self.consume_semantic_work()?;
                         self.memory_check()?;
                         self.set_loop_var_value(loop_target_expr, v.clone())?;
                         // For objects, index is key.
@@ -1659,7 +1748,7 @@ impl Interpreter {
     }
 
     fn eval_rule_ref(&mut self, rule_refr: &ExprRef) -> Result<Vec<Value>> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         let mut comps = vec![];
         let mut expr = rule_refr;
         loop {
@@ -1793,7 +1882,7 @@ impl Interpreter {
     }
 
     fn eval_output_expr_in_loop(&mut self, loops: &[HoistedLoop]) -> Result<bool> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         if loops.is_empty() {
             let (key_expr, output_expr) = self.get_exprs_from_context()?;
 
@@ -1973,18 +2062,21 @@ impl Interpreter {
         match self.eval_expr(Self::loop_collection_expr(loop_info))? {
             Value::Array(items) => {
                 for v in items.iter() {
+                    self.consume_semantic_work()?;
                     self.set_loop_var_value(loop_target_expr, v.clone())?;
                     result = self.eval_output_expr_in_loop(loop_tail)? || result;
                 }
             }
             Value::Set(items) => {
                 for v in items.iter() {
+                    self.consume_semantic_work()?;
                     self.set_loop_var_value(loop_target_expr, v.clone())?;
                     result = self.eval_output_expr_in_loop(loop_tail)? || result;
                 }
             }
             Value::Object(obj) => {
                 for (_, v) in obj.iter() {
+                    self.consume_semantic_work()?;
                     self.set_loop_var_value(loop_target_expr, v.clone())?;
                     result = self.eval_output_expr_in_loop(loop_tail)? || result;
                 }
@@ -2020,7 +2112,7 @@ impl Interpreter {
     }
 
     fn eval_output_expr(&mut self) -> Result<bool> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // Evaluate output expression after all the statements have been executed.
 
         let (key_expr, output_expr) = self.get_exprs_from_context()?;
@@ -2151,7 +2243,7 @@ impl Interpreter {
     }
 
     fn eval_query(&mut self, query: &Ref<Query>) -> Result<bool> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // Execute the query in a new scope
         self.scopes.push(Scope::new());
         let order_indices = {
@@ -2235,7 +2327,7 @@ impl Interpreter {
     }
 
     fn eval_array(&mut self, items: &Vec<ExprRef>) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         let mut array = Vec::new();
 
         for item in items {
@@ -2251,7 +2343,7 @@ impl Interpreter {
     }
 
     fn eval_object(&mut self, fields: &Vec<(Span, ExprRef, ExprRef)>) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         let mut object = BTreeMap::new();
 
         for (_, key, value) in fields {
@@ -2274,7 +2366,7 @@ impl Interpreter {
     }
 
     fn eval_set(&mut self, items: &Vec<ExprRef>) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         let mut set = BTreeSet::new();
 
         for item in items {
@@ -2294,7 +2386,7 @@ impl Interpreter {
         value: &ExprRef,
         collection: &ExprRef,
     ) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         let value = self.eval_expr(value)?;
         let collection = self.eval_expr(collection)?;
 
@@ -2332,7 +2424,7 @@ impl Interpreter {
     }
 
     fn eval_array_compr(&mut self, term: &ExprRef, query: &Ref<Query>) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // Push new context
         self.contexts.push(Context {
             output_expr: Some(term.clone()),
@@ -2351,7 +2443,7 @@ impl Interpreter {
     }
 
     fn eval_set_compr(&mut self, term: &ExprRef, query: &Ref<Query>) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // Push new context
         self.contexts.push(Context {
             output_expr: Some(term.clone()),
@@ -2374,7 +2466,7 @@ impl Interpreter {
         value: &ExprRef,
         query: &Ref<Query>,
     ) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // Push new context
         self.contexts.push(Context {
             key_expr: Some(key.clone()),
@@ -2478,7 +2570,7 @@ impl Interpreter {
         params: &[ExprRef],
         args: Vec<Value>,
     ) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // If any argument is undefined, then the call is undefined.
         if args.iter().any(|a| a == &Value::Undefined) {
             return Ok(Value::Undefined);
@@ -2625,7 +2717,7 @@ impl Interpreter {
         fcn: &ExprRef,
         params: &[ExprRef],
     ) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // Return generated values of walk builtin.
         if let Some(v) = self.get_loop_var_value(expr)? {
             return Ok(v.clone());
@@ -2830,6 +2922,13 @@ impl Interpreter {
                     // resolve paths through the wrong module's imports when
                     // the error is swallowed below in non-strict mode.
                     self.set_current_module(prev_module)?;
+                    if e.downcast_ref::<crate::EvaluationBudgetError>().is_some() {
+                        self.scopes = scopes;
+                        if let Some(saved) = &with_functions_saved {
+                            self.with_functions = saved.clone();
+                        }
+                        return Err(e);
+                    }
                     errors.push(e);
                     self.scopes = scopes;
                     continue;
@@ -2906,6 +3005,16 @@ impl Interpreter {
                         if let Rule::Default { value, .. } = rule.as_ref() {
                             match self.eval_expr(value) {
                                 Ok(v) => results.push(v),
+                                Err(e)
+                                    if e.downcast_ref::<crate::EvaluationBudgetError>()
+                                        .is_some() =>
+                                {
+                                    self.scopes = scopes;
+                                    if let Some(saved) = &with_functions_saved {
+                                        self.with_functions = saved.clone();
+                                    }
+                                    return Err(e);
+                                }
                                 Err(e) => errors.push(e),
                             }
                         }
@@ -2954,7 +3063,7 @@ impl Interpreter {
         extra_arg: Option<ExprRef>,
         allow_return_arg: bool,
     ) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // TODO: global var check; interop with `some var`
         if extra_arg.is_some() {
             let (last_param, arg_prefix) = params
@@ -3004,7 +3113,7 @@ impl Interpreter {
     }
 
     fn ensure_module_evaluated(&mut self, path: String) -> Result<()> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         for module in self.compiled_policy.modules.clone().iter().cloned() {
             if Some(&module) == self.module.as_ref() {
                 // Prevent cyclic evaluation.
@@ -3048,7 +3157,7 @@ impl Interpreter {
     }
 
     fn ensure_rule_evaluated(&mut self, path: String) -> Result<()> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         let mut matched = false;
         if let Some(rules) = self.compiled_policy.rules.get(&path) {
             matched = true;
@@ -3229,7 +3338,7 @@ impl Interpreter {
     }
 
     fn eval_expr(&mut self, expr: &ExprRef) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         #[cfg(feature = "coverage")]
         if self.enable_coverage {
             let span = expr.span();
@@ -3410,7 +3519,7 @@ impl Interpreter {
         span: &Span,
         bodies: &[RuleBody],
     ) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         let n_scopes = self.scopes.len();
         // Independent bodies of a partial (object/set) rule each contribute
         // keys/members. Bodies introduced by `else`, however, are mutually
@@ -3731,7 +3840,7 @@ impl Interpreter {
     }
 
     pub fn eval_default_rule(&mut self, rule: &Ref<Rule>) -> Result<()> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // Skip reprocessing rule.
         if self.processed.contains(rule) {
             return Ok(());
@@ -3805,7 +3914,7 @@ impl Interpreter {
     /// Evaluate a default rule and return the resulting value for compiler consumers.
     #[cfg(feature = "rvm")]
     pub fn eval_default_rule_for_compiler(&mut self, rule_path: &str) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         self.input = Value::Undefined;
         self.data = Value::Undefined;
         self.ensure_loop_var_values_capacity();
@@ -3899,7 +4008,7 @@ impl Interpreter {
     }
 
     fn eval_rule_impl(&mut self, module: &Ref<Module>, rule: &Ref<Rule>) -> Result<()> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         match rule.as_ref() {
             Rule::Spec {
                 span,
@@ -3928,7 +4037,9 @@ impl Interpreter {
                                 )?;
                             }
                         } else if is_set {
-                            if let Ok(mut comps) = self.eval_rule_ref(refr) {
+                            if let Some(mut comps) =
+                                Self::propagate_budget_error(self.eval_rule_ref(refr))?
+                            {
                                 let mut full_path = package_components;
                                 full_path.append(&mut comps);
                                 self.update_rule_value(span, full_path, Value::new_set(), true)?;
@@ -3936,7 +4047,9 @@ impl Interpreter {
                         } else if is_object {
                             // Fetch the rule, ignoring the key.
                             if let Expr::RefBrack { refr, .. } = refr.as_ref() {
-                                if let Ok(mut comps) = self.eval_rule_ref(refr) {
+                                if let Some(mut comps) =
+                                    Self::propagate_budget_error(self.eval_rule_ref(refr))?
+                                {
                                     let mut full_path = package_components;
                                     full_path.append(&mut comps);
                                     self.update_rule_value(
@@ -3998,7 +4111,7 @@ impl Interpreter {
     }
 
     pub fn eval_rule(&mut self, module: &Ref<Module>, rule: &Ref<Rule>) -> Result<()> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // Set current module index
         self.current_module_index = self.find_module_index(module);
 
@@ -4057,7 +4170,7 @@ impl Interpreter {
         query_schedule: Schedule,
         enable_tracing: bool,
     ) -> Result<QueryResults> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         self.traces = match enable_tracing {
             true => Some(vec![]),
             false => None,
@@ -4565,7 +4678,7 @@ impl Interpreter {
     }
 
     pub fn eval_rule_in_path(&mut self, path: String) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         if !self.compiled_policy.rule_paths.contains(&path) {
             bail!("not a valid rule path");
         }

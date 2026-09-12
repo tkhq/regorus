@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(interpreter)* Add a deterministic, `no_std`-compatible semantic-work budget shared by complete top-level evaluations, with typed limit errors and consumed-unit metrics.
+
 ### Fixed
 
 - *(rvm)* [**breaking**] Use the deterministic, `no_std`-compatible `EntryPointMap` type for program entry points and enforce load limits.
