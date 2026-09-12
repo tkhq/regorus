@@ -194,6 +194,7 @@ pub use utils::limits::{
 };
 pub use utils::limits::{
     EvaluationBudgetConfig, EvaluationBudgetError, EvaluationMetrics, LimitError,
+    EVALUATION_ACCOUNTING_VERSION,
 };
 pub use value::Value;
 

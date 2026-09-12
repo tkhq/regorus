@@ -38,6 +38,7 @@ pub fn register(m: &mut builtins::BuiltinsMap<&'static str, builtins::BuiltinFcn
     m.insert("strings.any_suffix_match", (any_suffix_match, 2));
     m.insert("strings.count", (strings_count, 2));
     m.insert("strings.replace_n", (replace_n, 2));
+    m.insert("strings.repeat", (repeat, 2));
     m.insert("strings.reverse", (reverse, 1));
     m.insert("substring", (substring, 3));
     m.insert("trim", (trim, 2));
@@ -661,6 +662,22 @@ fn replace_n(span: &Span, params: &[Ref<Expr>], args: &[Value], _strict: bool) -
     }
 
     Ok(Value::String(s.clone()))
+}
+
+fn repeat(span: &Span, params: &[Ref<Expr>], args: &[Value], strict: bool) -> Result<Value> {
+    let name = "strings.repeat";
+    ensure_args_count(span, name, params, args, 2)?;
+    let value = ensure_string(name, &params[0], &args[0])?;
+    let count = ensure_numeric(name, &params[1], &args[1])?;
+    let Some(count) = count.as_u64().and_then(|count| usize::try_from(count).ok()) else {
+        if strict {
+            bail!(params[1]
+                .span()
+                .error("repeat count must be a non-negative integer"));
+        }
+        return Ok(Value::Undefined);
+    };
+    Ok(Value::String(value.repeat(count).into()))
 }
 
 fn reverse(span: &Span, params: &[Ref<Expr>], args: &[Value], _strict: bool) -> Result<Value> {

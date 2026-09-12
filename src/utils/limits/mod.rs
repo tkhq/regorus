@@ -13,7 +13,9 @@ mod memory;
 mod time;
 
 pub(crate) use budget::EvaluationBudget;
-pub use budget::{EvaluationBudgetConfig, EvaluationBudgetError, EvaluationMetrics};
+pub use budget::{
+    EvaluationBudgetConfig, EvaluationBudgetError, EvaluationMetrics, EVALUATION_ACCOUNTING_VERSION,
+};
 #[allow(unused_imports)]
 pub use error::LimitError;
 

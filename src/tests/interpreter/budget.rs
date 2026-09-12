@@ -1,8 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use alloc::boxed::Box;
 use alloc::string::ToString as _;
+use alloc::sync::Arc;
+use alloc::{vec, vec::Vec};
 use anyhow::Result;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::utils::limits::{EvaluationBudgetConfig, EvaluationBudgetError};
 use crate::{Engine, Value};
@@ -140,5 +144,119 @@ answer := input.value
     let result = engine.eval_rule("data.budget.answer".to_string())?;
     assert_eq!(result, Value::from(7));
     assert!(engine.evaluation_metrics().consumed < 1_000);
+    Ok(())
+}
+
+#[test]
+fn range_expansion_is_rejected_before_dispatch() -> Result<()> {
+    let mut engine = engine_with_policy(
+        r#"
+package budget
+
+answer := count(numbers.range(0, 10000000))
+"#,
+    )?;
+    engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 50 });
+
+    let error = engine
+        .eval_rule("data.budget.answer".to_string())
+        .expect_err("range expansion must exceed the preflight budget");
+    let error = budget_error(&error);
+
+    assert_eq!(error.limit, 50);
+    assert!(error.consumed > error.limit);
+    Ok(())
+}
+
+#[test]
+fn string_repeat_expansion_is_rejected_before_dispatch() -> Result<()> {
+    let mut engine = engine_with_policy(
+        r#"
+package budget
+
+answer := strings.repeat("x", 10000000)
+"#,
+    )?;
+    engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 50 });
+
+    let error = engine
+        .eval_rule("data.budget.answer".to_string())
+        .expect_err("string repetition must exceed the preflight budget");
+    let error = budget_error(&error);
+
+    assert_eq!(error.limit, 50);
+    assert!(error.consumed > error.limit);
+    Ok(())
+}
+
+#[test]
+fn larger_builtin_values_consume_more_structural_work() -> Result<()> {
+    let mut engine = engine_with_policy(
+        r#"
+package budget
+
+answer := count(input)
+"#,
+    )?;
+    engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 100_000 });
+
+    engine.set_input(Value::from("x"));
+    engine.eval_rule("data.budget.answer".to_string())?;
+    let short_string = engine.evaluation_metrics().consumed;
+
+    engine.set_input(Value::from("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
+    engine.eval_rule("data.budget.answer".to_string())?;
+    let long_string = engine.evaluation_metrics().consumed;
+
+    engine.set_input(Value::from_array(vec![Value::from(1)]));
+    engine.eval_rule("data.budget.answer".to_string())?;
+    let short_array = engine.evaluation_metrics().consumed;
+
+    engine.set_input(Value::from_array(
+        (0..16).map(Value::from).collect::<Vec<_>>(),
+    ));
+    engine.eval_rule("data.budget.answer".to_string())?;
+    let long_array = engine.evaluation_metrics().consumed;
+
+    assert!(long_string > short_string);
+    assert!(long_array > short_array);
+    Ok(())
+}
+
+#[test]
+fn extensions_are_rejected_before_invocation_while_budgeting() -> Result<()> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let extension_calls = calls.clone();
+    let mut engine = engine_with_policy(
+        r#"
+package budget
+
+answer := custom_repeat("x")
+"#,
+    )?;
+    engine.add_extension(
+        "custom_repeat".to_string(),
+        1,
+        Box::new(move |args: Vec<Value>| {
+            extension_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(args.first().cloned().unwrap_or(Value::Undefined))
+        }),
+    )?;
+
+    assert_eq!(
+        engine.eval_rule("data.budget.answer".to_string())?,
+        Value::from("x")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 1_000 });
+    let error = engine
+        .eval_rule("data.budget.answer".to_string())
+        .expect_err("an extension without an estimator must be rejected");
+
+    assert!(error
+        .to_string()
+        .contains("extension `custom_repeat` has no deterministic work estimator"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     Ok(())
 }

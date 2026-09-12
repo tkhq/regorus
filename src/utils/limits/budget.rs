@@ -3,6 +3,15 @@
 
 use core::fmt;
 
+/// Version of the deterministic evaluation-work accounting contract.
+///
+/// Version 1 charges one unit for scalar values, one plus the byte length for strings,
+/// one plus the element count plus child weights for arrays and sets, and one plus twice
+/// the entry count plus key and value weights for objects. Builtins also charge argument
+/// weights, a declared preflight projection, and the actual result weight. A budgeted call
+/// is rejected before dispatch when its builtin or extension has no declared estimator.
+pub const EVALUATION_ACCOUNTING_VERSION: u32 = 1;
+
 /// Configuration for deterministic interpreter evaluation budgeting.
 ///
 /// A budget unit represents one semantic interpreter checkpoint. A unit is
@@ -23,14 +32,14 @@ pub struct EvaluationBudgetConfig {
 /// Metrics for the most recently started top-level interpreter evaluation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EvaluationMetrics {
-    /// Semantic work units consumed, including the unit that exceeded a limit.
+    /// Semantic work units consumed, including a charge that exceeded a limit.
     pub consumed: u64,
 }
 
 /// Typed error returned when deterministic semantic work exceeds its limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EvaluationBudgetError {
-    /// Work units consumed, including the unit that exceeded the limit.
+    /// Work units consumed, including a charge that exceeded the limit.
     pub consumed: u64,
     /// Configured semantic work-unit limit.
     pub limit: u64,
@@ -84,11 +93,22 @@ impl EvaluationBudget {
         }
     }
 
+    pub(crate) const fn is_limited(&self) -> bool {
+        self.active && self.config.is_some()
+    }
+
     pub(crate) const fn consume(&mut self) -> core::result::Result<(), EvaluationBudgetError> {
-        if !self.active {
+        self.consume_n(1)
+    }
+
+    pub(crate) const fn consume_n(
+        &mut self,
+        units: u64,
+    ) -> core::result::Result<(), EvaluationBudgetError> {
+        if !self.active || units == 0 {
             return Ok(());
         }
-        self.consumed = self.consumed.saturating_add(1);
+        self.consumed = self.consumed.saturating_add(units);
         if let Some(config) = self.config {
             if self.consumed > config.limit {
                 return Err(EvaluationBudgetError {

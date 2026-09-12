@@ -155,11 +155,15 @@ impl Engine {
     /// Units are consumed at deterministic semantic checkpoints: expression and statement
     /// dispatch, queries and rule bodies, rule and function calls, builtin and extension
     /// calls, compound-expression helpers, collection assembly, each loop or comprehension
-    /// iteration, each `with` modifier, and uncached virtual-document work. Compound and
-    /// nested operations reach multiple checkpoints and share one top-level budget. The
+    /// iteration, each `with` modifier, and uncached virtual-document work. Builtins also
+    /// charge structural argument and result weights plus a preflight projection. A budgeted
+    /// builtin or extension without a declared estimator is rejected before dispatch. Compound
+    /// and nested operations reach multiple checkpoints and share one top-level budget. The
     /// budget is reset before each [`eval_query`](Self::eval_query),
     /// [`eval_rule`](Self::eval_rule), or other top-level interpreter evaluation. It does
-    /// not read or depend on a clock.
+    /// not read or depend on a clock. See
+    /// [`EVALUATION_ACCOUNTING_VERSION`](crate::EVALUATION_ACCOUNTING_VERSION) for the versioned
+    /// value-weight contract.
     ///
     /// Exceeding the limit returns
     /// [`EvaluationBudgetError`](crate::utils::limits::EvaluationBudgetError).

@@ -320,7 +320,347 @@ impl Interpreter {
 
     #[inline]
     fn consume_semantic_work(&mut self) -> Result<()> {
-        self.evaluation_budget.consume().map_err(anyhow::Error::new)
+        self.consume_semantic_work_n(1)
+    }
+
+    #[inline]
+    fn consume_semantic_work_n(&mut self, units: u64) -> Result<()> {
+        self.evaluation_budget
+            .consume_n(units)
+            .map_err(anyhow::Error::new)
+    }
+
+    fn charge_value_structure(&mut self, root: &Value) -> Result<u64> {
+        let mut total = 0_u64;
+        let mut pending = vec![root];
+        while let Some(value) = pending.pop() {
+            let units = match value {
+                Value::String(value) => {
+                    1_u64.saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX))
+                }
+                Value::Array(values) => {
+                    let units =
+                        1_u64.saturating_add(u64::try_from(values.len()).unwrap_or(u64::MAX));
+                    self.consume_semantic_work_n(units)?;
+                    total = total.saturating_add(units);
+                    pending.extend(values.iter().rev());
+                    continue;
+                }
+                Value::Set(values) => {
+                    let units =
+                        1_u64.saturating_add(u64::try_from(values.len()).unwrap_or(u64::MAX));
+                    self.consume_semantic_work_n(units)?;
+                    total = total.saturating_add(units);
+                    pending.extend(values.iter_sorted().rev());
+                    continue;
+                }
+                Value::Object(values) => {
+                    let units = 1_u64.saturating_add(
+                        (u64::try_from(values.len()).unwrap_or(u64::MAX)).saturating_mul(2),
+                    );
+                    self.consume_semantic_work_n(units)?;
+                    total = total.saturating_add(units);
+                    for (key, child_value) in values.iter_sorted().rev() {
+                        pending.push(child_value);
+                        pending.push(key);
+                    }
+                    continue;
+                }
+                Value::Null | Value::Bool(_) | Value::Number(_) | Value::Undefined => 1,
+            };
+            self.consume_semantic_work_n(units)?;
+            total = total.saturating_add(units);
+        }
+        Ok(total)
+    }
+
+    fn charge_values_structure(&mut self, values: &[Value]) -> Result<u64> {
+        values.iter().try_fold(0_u64, |total, value| {
+            self.charge_value_structure(value)
+                .map(|units| total.saturating_add(units))
+        })
+    }
+
+    fn range_projection(args: &[Value], step_index: Option<usize>) -> u64 {
+        let Some(Value::Number(start)) = args.first() else {
+            return 1;
+        };
+        let Some(Value::Number(end)) = args.get(1) else {
+            return 1;
+        };
+        let (Some(start), Some(end)) = (start.as_i64(), end.as_i64()) else {
+            return u64::MAX;
+        };
+        let distance = start.abs_diff(end);
+        let step = step_index
+            .and_then(|index| args.get(index))
+            .and_then(|value| match value {
+                Value::Number(number) => number.as_u64(),
+                _ => None,
+            })
+            .unwrap_or(1);
+        if step == 0 {
+            return 1;
+        }
+        let elements = distance
+            .checked_div(step)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        1_u64.saturating_add(elements.saturating_mul(2))
+    }
+
+    fn string_repeat_projection(args: &[Value]) -> u64 {
+        let length = args
+            .first()
+            .and_then(|value| match value {
+                Value::String(value) => Some(u64::try_from(value.len()).unwrap_or(u64::MAX)),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let count = args
+            .get(1)
+            .and_then(|value| match value {
+                Value::Number(value) => value.as_u64(),
+                _ => None,
+            })
+            .unwrap_or(0);
+        1_u64.saturating_add(length.saturating_mul(count))
+    }
+
+    fn cidr_expand_projection(args: &[Value]) -> u64 {
+        let Some(Value::String(cidr)) = args.first() else {
+            return 1;
+        };
+        let Some((address, prefix)) = cidr.rsplit_once('/') else {
+            return 1;
+        };
+        let Ok(prefix) = prefix.parse::<u32>() else {
+            return 1;
+        };
+        let Ok(address) = address.parse::<core::net::IpAddr>() else {
+            return 1;
+        };
+        let address_bits: u32 = if address.is_ipv6() { 128 } else { 32 };
+        let Some(host_bits) = address_bits.checked_sub(prefix) else {
+            return 1;
+        };
+        let hosts = 1_u64.checked_shl(host_bits).unwrap_or(u64::MAX);
+        // Each result is an array element and an IP string of at most 39 bytes.
+        1_u64.saturating_add(hosts.saturating_mul(41))
+    }
+
+    fn azure_range_projection(args: &[Value]) -> u64 {
+        let count = args
+            .get(1)
+            .and_then(|value| match value {
+                Value::Number(value) => value.as_u64(),
+                _ => None,
+            })
+            .unwrap_or(0);
+        1_u64.saturating_add(count.saturating_mul(2))
+    }
+
+    fn azure_pad_left_projection(args: &[Value]) -> u64 {
+        let width = args
+            .get(1)
+            .and_then(|value| match value {
+                Value::Number(value) => value.as_u64(),
+                Value::String(value) => value.parse::<u64>().ok(),
+                _ => None,
+            })
+            .unwrap_or(0);
+        // A Unicode padding character occupies at most four UTF-8 bytes.
+        1_u64.saturating_add(width.saturating_mul(4))
+    }
+
+    fn replacement_projection(args: &[Value]) -> u64 {
+        let input = args
+            .first()
+            .and_then(|value| match value {
+                Value::String(value) => Some(u64::try_from(value.len()).unwrap_or(u64::MAX)),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let replacement = args
+            .get(2)
+            .and_then(|value| match value {
+                Value::String(value) => Some(u64::try_from(value.len()).unwrap_or(u64::MAX)),
+                _ => None,
+            })
+            .unwrap_or(0);
+        1_u64
+            .saturating_add(replacement)
+            .saturating_add(input.saturating_mul(replacement.saturating_add(1)))
+    }
+
+    fn builtin_work_projection(name: &str, args: &[Value], argument_work: u64) -> Option<u64> {
+        let linear = argument_work.max(1);
+        let quadratic = linear.saturating_mul(linear);
+        Some(match name {
+            "numbers.range" => Self::range_projection(args, None),
+            "numbers.range_step" => Self::range_projection(args, Some(2)),
+            "strings.repeat" => Self::string_repeat_projection(args),
+            "net.cidr_expand" => Self::cidr_expand_projection(args),
+            "azure.policy.fn.range" => Self::azure_range_projection(args),
+            "azure.policy.fn.pad_left" => Self::azure_pad_left_projection(args),
+            "replace" | "regex.replace" => Self::replacement_projection(args),
+            "split" | "regex.split" | "azure.policy.fn.split" => linear.saturating_mul(2),
+            "concat"
+            | "array.concat"
+            | "azure.policy.fn.join"
+            | "sprintf"
+            | "format_int"
+            | "azure.policy.fn.format" => quadratic,
+            "base64.decode"
+            | "base64.encode"
+            | "base64url.decode"
+            | "base64url.encode"
+            | "base64url.encode_no_pad"
+            | "hex.decode"
+            | "hex.encode"
+            | "urlquery.decode"
+            | "urlquery.decode_object"
+            | "urlquery.encode"
+            | "urlquery.encode_object"
+            | "json.marshal"
+            | "json.unmarshal"
+            | "azure.policy.fn.base64"
+            | "azure.policy.fn.base64_to_json"
+            | "azure.policy.fn.base64_to_string"
+            | "azure.policy.fn.data_uri"
+            | "azure.policy.fn.data_uri_to_string"
+            | "azure.policy.fn.json"
+            | "azure.policy.fn.string"
+            | "azure.policy.fn.uri"
+            | "azure.policy.fn.uri_component"
+            | "azure.policy.fn.uri_component_to_string" => linear.saturating_mul(8),
+            "walk" | "graph.reachable" | "yaml.marshal" => quadratic,
+            "array.reverse"
+            | "array.slice"
+            | "indexof_n"
+            | "regex.find_n"
+            | "object.filter"
+            | "object.keys"
+            | "object.remove"
+            | "object.union"
+            | "object.union_n"
+            | "json.filter"
+            | "json.patch"
+            | "json.remove"
+            | "sort"
+            | "intersection"
+            | "union"
+            | "__builtin_sets.intersection"
+            | "__builtin_sets.union"
+            | "azure.policy.fn.array"
+            | "azure.policy.fn.create_object"
+            | "azure.policy.fn.intersection"
+            | "azure.policy.fn.items"
+            | "azure.policy.fn.skip"
+            | "azure.policy.fn.take"
+            | "azure.policy.fn.union" => quadratic,
+            "abs"
+            | "ceil"
+            | "floor"
+            | "round"
+            | "count"
+            | "max"
+            | "min"
+            | "product"
+            | "sum"
+            | "bits.and"
+            | "bits.lsh"
+            | "bits.negate"
+            | "bits.or"
+            | "bits.rsh"
+            | "bits.xor"
+            | "contains"
+            | "endswith"
+            | "glob.match"
+            | "glob.quote_meta"
+            | "indexof"
+            | "is_array"
+            | "is_boolean"
+            | "is_null"
+            | "is_number"
+            | "is_object"
+            | "is_set"
+            | "is_string"
+            | "json.is_valid"
+            | "lower"
+            | "net.cidr_contains"
+            | "net.cidr_is_valid"
+            | "object.get"
+            | "object.subset"
+            | "regex.globs_match"
+            | "regex.is_valid"
+            | "regex.match"
+            | "regex.template_match"
+            | "semver.compare"
+            | "semver.is_valid"
+            | "startswith"
+            | "strings.any_prefix_match"
+            | "strings.any_suffix_match"
+            | "strings.count"
+            | "strings.reverse"
+            | "substring"
+            | "to_number"
+            | "trace"
+            | "trim"
+            | "trim_left"
+            | "trim_prefix"
+            | "trim_right"
+            | "trim_space"
+            | "trim_suffix"
+            | "type_name"
+            | "units.parse"
+            | "units.parse_bytes"
+            | "upper"
+            | "uuid.parse"
+            | "base64.is_valid"
+            | "time.add_date"
+            | "time.clock"
+            | "time.date"
+            | "time.diff"
+            | "time.format"
+            | "time.now_ns"
+            | "time.parse_duration_ns"
+            | "time.parse_ns"
+            | "time.parse_rfc3339_ns"
+            | "time.weekday"
+            | "azure.policy.fn.bool"
+            | "azure.policy.fn.coalesce"
+            | "azure.policy.fn.empty"
+            | "azure.policy.fn.ends_with"
+            | "azure.policy.fn.first"
+            | "azure.policy.fn.float"
+            | "azure.policy.fn.index_from_end"
+            | "azure.policy.fn.index_of"
+            | "azure.policy.fn.int"
+            | "azure.policy.fn.int_div"
+            | "azure.policy.fn.int_mod"
+            | "azure.policy.fn.last"
+            | "azure.policy.fn.last_index_of"
+            | "azure.policy.fn.max"
+            | "azure.policy.fn.min"
+            | "azure.policy.fn.starts_with"
+            | "azure.policy.fn.trim"
+            | "azure.policy.fn.try_get"
+            | "azure.policy.fn.try_index_from_end"
+            | "azure.policy.fn.date_time_add"
+            | "azure.policy.fn.date_time_from_epoch"
+            | "azure.policy.fn.date_time_to_epoch"
+            | "azure.policy.fn.add_days"
+            | "azure.policy.fn.ip_range_contains"
+            | "azure.policy.get_parameter"
+            | "azure.policy.if"
+            | "azure.policy.logic_all"
+            | "azure.policy.logic_any" => quadratic,
+            // External I/O, runtime, schema, random, potentially exponential expansion, and test
+            // builtins do not have safe deterministic projections from their arguments. Budgeted
+            // evaluation rejects them.
+            _ => return None,
+        })
     }
 
     #[inline]
@@ -2576,10 +2916,22 @@ impl Interpreter {
             return Ok(Value::Undefined);
         }
 
+        let argument_work = self.charge_values_structure(&args)?;
+        if self.evaluation_budget.is_limited() {
+            let projected = Self::builtin_work_projection(name, &args, argument_work)
+                .ok_or_else(|| anyhow!("builtin `{name}` has no deterministic work estimator"))?;
+            self.consume_semantic_work_n(projected)?;
+        }
+
         let cache = builtins::must_cache(name);
         if let Some(cached_key) = &cache {
-            if let Some(v) = self.builtins_cache.get(&(cached_key, args.clone())) {
-                return Ok(v.clone());
+            if let Some(value) = self
+                .builtins_cache
+                .get(&(cached_key, args.clone()))
+                .cloned()
+            {
+                self.charge_value_structure(&value)?;
+                return Ok(value);
             }
         }
 
@@ -2600,6 +2952,8 @@ impl Interpreter {
             }
             Err(e) => Err(e)?,
         };
+
+        self.charge_value_structure(&v)?;
 
         // Handle trace function.
         // TODO: with modifier.
@@ -2779,11 +3133,19 @@ impl Interpreter {
                     // process default functions later.
                     (&empty, self.module.clone())
                 }
-                // Look up extension.
-                else if let Some(ext) = self.extensions.get_mut(&selected_fcn_path) {
-                    extension = Some(ext);
+                // Extensions and print have no declared deterministic estimator.
+                else if self.extensions.contains_key(&selected_fcn_path) {
+                    if self.evaluation_budget.is_limited() {
+                        bail!(
+                            "extension `{selected_fcn_path}` has no deterministic work estimator"
+                        );
+                    }
+                    extension = self.extensions.get_mut(&selected_fcn_path);
                     (&empty, None)
                 } else if selected_fcn_path == "print" {
+                    if self.evaluation_budget.is_limited() {
+                        bail!("builtin `print` has no deterministic work estimator");
+                    }
                     return self.eval_print(span, params, param_values);
                 }
                 // Look up builtin function.
