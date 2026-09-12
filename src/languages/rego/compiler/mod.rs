@@ -22,7 +22,7 @@ pub use error::{CompilerError, Result, SpannedCompilerError};
 
 use crate::ast::ExprRef;
 use crate::lexer::Span;
-use crate::rvm::program::{Program, RuleType, SpanInfo};
+use crate::rvm::program::{EntryPointMap, Program, RuleType, SpanInfo};
 use crate::CompiledPolicy;
 use crate::Value;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -31,7 +31,6 @@ use alloc::string::String;
 use alloc::string::ToString as _;
 use alloc::vec;
 use alloc::vec::Vec;
-use indexmap::IndexMap;
 
 pub type Register = u8;
 
@@ -141,7 +140,7 @@ pub struct Compiler<'a> {
     current_data_register: Option<Register>,
     current_rule_path: String,
     current_call_stack: Vec<u16>,
-    entry_points: IndexMap<String, usize>,
+    entry_points: EntryPointMap,
     soft_assert_mode: bool,
     /// Registered host-awaitable builtins: name → expected arg count.
     /// When the compiler encounters a call to one of these names, it emits a
@@ -180,7 +179,7 @@ impl<'a> Compiler<'a> {
             current_data_register: None,
             current_rule_path: String::new(),
             current_call_stack: Vec::new(),
-            entry_points: IndexMap::new(),
+            entry_points: EntryPointMap::default(),
             soft_assert_mode: false,
             host_await_builtins: BTreeMap::new(),
         }

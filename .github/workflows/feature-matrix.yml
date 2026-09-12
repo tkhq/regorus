@@ -66,6 +66,10 @@ jobs:
           - name: no_std
             features: arc,opa-no-std
 
+          # RVM must also compile with the alloc-only OPA feature set.
+          - name: no_std + RVM
+            features: opa-no-std,rvm
+
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Setup Rust toolchain

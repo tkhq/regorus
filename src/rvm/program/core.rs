@@ -5,9 +5,9 @@ use alloc::format;
 use alloc::string::{String, ToString as _};
 use alloc::vec::Vec;
 use anyhow::Result as AnyResult;
-use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+use super::entry_point_map::EntryPointMap;
 use super::metadata::ProgramMetadata;
 use super::types::{BuiltinInfo, RuleInfo, SourceFile, SpanInfo};
 use crate::builtins::BuiltinFcn;
@@ -32,8 +32,8 @@ pub struct Program {
     pub builtin_info_table: Vec<BuiltinInfo>,
 
     /// Entry points mapping with preserved insertion order (skipped in serde, serialized separately as JSON)
-    #[serde(skip, default = "IndexMap::new")]
-    pub entry_points: IndexMap<String, usize>,
+    #[serde(skip, default = "EntryPointMap::default")]
+    pub entry_points: EntryPointMap,
 
     /// Source files table with content (skipped in serde, serialized separately as JSON)
     #[serde(skip, default = "Vec::new")]
@@ -116,7 +116,7 @@ impl Program {
             literals: Vec::new(),
             instruction_data: InstructionData::new(),
             builtin_info_table: Vec::new(),
-            entry_points: IndexMap::new(),
+            entry_points: EntryPointMap::default(),
             sources: Vec::new(),
             rule_infos: Vec::new(),
             instruction_spans: Vec::new(),
@@ -409,8 +409,8 @@ impl Program {
         self.entry_points.get(path).copied()
     }
 
-    /// Get all entry points as IndexMap
-    pub const fn get_entry_points(&self) -> &IndexMap<String, usize> {
+    /// Get all entry points in insertion order.
+    pub const fn get_entry_points(&self) -> &EntryPointMap {
         &self.entry_points
     }
 

@@ -7,11 +7,10 @@ use alloc::vec::Vec;
 
 use super::super::metadata::ProgramMetadata;
 use super::super::types::{BuiltinInfo, RuleInfo, SourceFile, SpanInfo};
-use super::Program;
+use super::super::{EntryPointMap, Program};
 use crate::rvm::instructions::InstructionData;
 use crate::rvm::Instruction;
 use crate::value::Value;
-use indexmap::IndexMap;
 
 impl Program {
     /// Serialize to JSON format with complete program information and proper field names
@@ -168,7 +167,7 @@ impl Program {
             .map(|v| serde_json::from_value(v.clone()).unwrap_or_default())
             .unwrap_or_default();
 
-        let entry_points: IndexMap<String, usize> = json_data
+        let entry_points: EntryPointMap = json_data
             .get("entry_points")
             .map(|v| serde_json::from_value(v.clone()).unwrap_or_default())
             .unwrap_or_default();

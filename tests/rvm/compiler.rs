@@ -51,6 +51,41 @@ fn assert_literal_exists(program: &regorus::rvm::program::Program, expected: &Va
 }
 
 #[test]
+fn entry_point_order_is_stable_across_serialization() {
+    use regorus::rvm::program::{DeserializationResult, Program};
+
+    let mut first = Program::new();
+    first.add_entry_point("data.test.z".to_string(), 2);
+    first.add_entry_point("data.test.a".to_string(), 1);
+
+    let mut second = Program::new();
+    second.add_entry_point("data.test.z".to_string(), 2);
+    second.add_entry_point("data.test.a".to_string(), 1);
+
+    let first_binary = first.serialize_binary().unwrap();
+    assert_eq!(first_binary, second.serialize_binary().unwrap());
+
+    let decoded = match Program::deserialize_binary(&first_binary).unwrap() {
+        DeserializationResult::Complete(program) => program,
+        DeserializationResult::Partial(_) => panic!("entry point program decoded partially"),
+    };
+    assert_eq!(decoded.serialize_binary().unwrap(), first_binary);
+    assert_eq!(
+        decoded
+            .get_entry_points()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["data.test.z", "data.test.a"]
+    );
+
+    let first_json = first.serialize_json().unwrap();
+    assert_eq!(first_json, second.serialize_json().unwrap());
+    let decoded_json = Program::deserialize_json(&first_json).unwrap();
+    assert_eq!(decoded_json.serialize_json().unwrap(), first_json);
+}
+
+#[test]
 fn constant_array_is_hoisted() {
     let program = compile_rule(
         r#"
