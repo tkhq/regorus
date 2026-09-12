@@ -230,6 +230,8 @@ impl Program {
             program.recompute_host_await_presence();
         }
 
+        program.validate_limits()?;
+
         if !program.builtin_info_table.is_empty() {
             let _ = program.initialize_resolved_builtins();
         }

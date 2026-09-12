@@ -155,6 +155,7 @@ impl Program {
                 let mut program = Program::new();
                 program.needs_recompilation = true;
                 program.rego_v0 = Self::legacy_rego_v0(data, version).unwrap_or(false);
+                program.validate_limits()?;
                 Ok(DeserializationResult::Partial(program))
             }
             6 => {
@@ -250,6 +251,7 @@ impl Program {
                 program.rule_tree = rule_tree;
                 program.rego_v0 = rego_v0;
                 program.needs_recompilation = needs_recompilation;
+                program.validate_limits()?;
 
                 if !program.builtin_info_table.is_empty() {
                     if let Err(_e) = program.initialize_resolved_builtins() {

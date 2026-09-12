@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-#![cfg(feature = "rvm")]
+#![cfg(all(feature = "rvm", feature = "std"))]
 
 use anyhow::Result;
 use regorus::rvm::vm::{ExecutionMode, ExecutionState, SuspendReason, VmError};
