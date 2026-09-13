@@ -345,6 +345,58 @@ fn bigint_magnitude_increases_structural_work() -> Result<()> {
 }
 
 #[test]
+fn type_introspection_is_constant_time_and_does_not_hide_later_work() -> Result<()> {
+    let predicates = [
+        ("is_null", Value::Null),
+        ("is_boolean", Value::Bool(true)),
+        ("is_number", Value::from(1)),
+        ("is_string", Value::from("x".repeat(200 * 1024))),
+        (
+            "is_array",
+            Value::from_array(vec![Value::from("x".repeat(200 * 1024))]),
+        ),
+        (
+            "is_object",
+            Value::from_map(BTreeMap::from([(
+                Value::from("nested"),
+                Value::from_array(vec![Value::from("x".repeat(200 * 1024))]),
+            )])),
+        ),
+        (
+            "is_set",
+            Value::from_set([Value::from("x".repeat(200 * 1024))].into_iter().collect()),
+        ),
+    ];
+    for (predicate, input) in predicates {
+        let policy = format!("package budget\nanswer := {predicate}(input)\n");
+        assert!(budgeted_work(&policy, input.clone(), 100)? < 100);
+        assert!(budgeted_work("package budget\nanswer := type_name(input)\n", input, 100)? < 100);
+    }
+
+    for bytes in [200 * 1024, 8 * 1024 * 1024] {
+        let input = Value::from("x".repeat(bytes));
+        let repeated =
+            "package budget\nanswer := [is_string(input) | _ := numbers.range(0, 999)[_]]\n";
+        assert!(budgeted_work(repeated, input.clone(), 100_000)? < 100_000);
+        let guarded_count = "package budget\nanswer := count(input) if { is_string(input) }\n";
+        let work = budgeted_work(guarded_count, input.clone(), 10_000_000)?;
+        assert!(work >= u64::try_from(bytes).unwrap_or(u64::MAX));
+
+        let mut engine = engine_with_policy(
+            r#"package budget
+answer := regex.match("x", input) if { is_string(input) }
+"#,
+        )?;
+        engine.set_input(input);
+        engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 100_000 });
+        engine
+            .eval_rule("data.budget.answer".to_string())
+            .expect_err("constant-time guards must not make later scans free");
+    }
+    Ok(())
+}
+
+#[test]
 fn unsafe_numeric_deserializers_are_default_denied() -> Result<()> {
     for call in [
         r#"json.unmarshal("1e2000000000")"#,

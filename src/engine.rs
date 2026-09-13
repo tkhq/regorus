@@ -159,6 +159,8 @@ impl Engine {
     /// charges setup once and then each visited element or entry, including nested structure.
     /// References and cache hits charge shared-value cloning rather than the full parent. Builtins
     /// charge argument references, operation-specific preflight work, and full result structure.
+    /// The seven discriminant-only type predicates charge one argument and one projection unit;
+    /// `type_name` additionally precharges its exact bounded result string.
     /// Number weights include binary magnitude bytes, and arithmetic is precharged from magnitudes.
     /// Comparisons project corresponding structure up to the smaller operand and stop at the
     /// current remaining budget plus one. BTree lookup bounds 11 key comparisons per level for

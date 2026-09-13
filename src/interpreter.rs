@@ -833,7 +833,35 @@ impl Interpreter {
         compile.saturating_add(search).saturating_add(output)
     }
 
+    fn is_type_introspection(name: &str) -> bool {
+        matches!(
+            name,
+            "is_array"
+                | "is_boolean"
+                | "is_null"
+                | "is_number"
+                | "is_object"
+                | "is_set"
+                | "is_string"
+                | "type_name"
+        )
+    }
+
     fn builtin_work_projection(name: &str, args: &[Value]) -> Option<u64> {
+        if Self::is_type_introspection(name) {
+            return Some(if name == "type_name" {
+                args.first().map_or(1, |value| {
+                    1_u64.saturating_add(
+                        builtins::types::get_type(value)
+                            .len()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
+                    )
+                })
+            } else {
+                1
+            });
+        }
         let linear = || Self::values_structure_projection(args).max(1);
         let quadratic = || linear().saturating_mul(linear());
         Some(match name {
@@ -941,13 +969,6 @@ impl Interpreter {
             | "glob.match"
             | "glob.quote_meta"
             | "indexof"
-            | "is_array"
-            | "is_boolean"
-            | "is_null"
-            | "is_number"
-            | "is_object"
-            | "is_set"
-            | "is_string"
             | "lower"
             | "net.cidr_contains"
             | "net.cidr_is_valid"
@@ -967,7 +988,6 @@ impl Interpreter {
             | "trim_right"
             | "trim_space"
             | "trim_suffix"
-            | "type_name"
             | "upper"
             | "uuid.parse"
             | "base64.is_valid"
@@ -3324,7 +3344,11 @@ impl Interpreter {
             return Ok(Value::Undefined);
         }
 
-        self.charge_values_reference(&args)?;
+        if Self::is_type_introspection(name) {
+            self.consume_semantic_work_n(u64::try_from(args.len()).unwrap_or(u64::MAX))?;
+        } else {
+            self.charge_values_reference(&args)?;
+        }
         if self.evaluation_budget.is_limited() {
             let projected = Self::builtin_work_projection(name, &args)
                 .ok_or_else(|| anyhow!("builtin `{name}` has no deterministic work estimator"))?;

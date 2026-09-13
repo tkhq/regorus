@@ -11,7 +11,8 @@ use core::fmt;
 /// iteration charges one setup unit, then one slot plus the visited element weight, or two slots
 /// plus visited key and value weights. References and cache hits charge their cloned scalar or one
 /// shared-value unit instead of the full parent. Builtins charge argument-reference weights, a
-/// declared preflight projection, and the actual result weight. Regex projections saturatingly
+/// declared preflight projection, and the actual result weight. Type predicates charge one unit;
+/// `type_name` precharges its fixed discriminant-name output. Regex projections saturatingly
 /// charge pattern² compilation, pattern × haystack search, and operation-specific output bounds.
 /// Arithmetic charges a magnitude-based projection before evaluation. Equality and ordering charge
 /// corresponding structure up to the smaller operand, capped at the current remaining budget plus
