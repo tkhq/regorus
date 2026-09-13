@@ -395,38 +395,98 @@ impl Interpreter {
         Ok(())
     }
 
+    // Projection stops after deterministic work exceeds this bound. Returning MAX makes any
+    // finite budget reject before projection itself can become an unbounded pre-budget traversal.
+    const STRUCTURE_PROJECTION_CAP: u64 = 65_536;
+
     fn value_structure_projection(root: &Value) -> u64 {
+        Self::value_structure_projection_capped(root, u64::MAX)
+    }
+
+    fn value_structure_projection_capped(root: &Value, cap: u64) -> u64 {
         let mut total = 0_u64;
         let mut pending = vec![root];
         while let Some(value) = pending.pop() {
-            total = total.saturating_add(match value {
+            let units = match value {
                 Value::String(value) => {
                     1_u64.saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX))
                 }
                 Value::Array(values) => {
+                    let units = 1_u64.saturating_add(values.len().try_into().unwrap_or(u64::MAX));
+                    if total.saturating_add(units) > cap {
+                        return u64::MAX;
+                    }
                     pending.extend(values.iter());
-                    1_u64.saturating_add(u64::try_from(values.len()).unwrap_or(u64::MAX))
+                    units
                 }
                 Value::Set(values) => {
+                    let units = 1_u64.saturating_add(values.len().try_into().unwrap_or(u64::MAX));
+                    if total.saturating_add(units) > cap {
+                        return u64::MAX;
+                    }
                     pending.extend(values.iter_sorted());
-                    1_u64.saturating_add(u64::try_from(values.len()).unwrap_or(u64::MAX))
+                    units
                 }
                 Value::Object(values) => {
+                    let units = 1_u64.saturating_add(
+                        u64::try_from(values.len())
+                            .unwrap_or(u64::MAX)
+                            .saturating_mul(2),
+                    );
+                    if total.saturating_add(units) > cap {
+                        return u64::MAX;
+                    }
                     for (key, child_value) in values.iter_sorted() {
                         pending.push(key);
                         pending.push(child_value);
                     }
-                    1_u64.saturating_add(
-                        u64::try_from(values.len())
-                            .unwrap_or(u64::MAX)
-                            .saturating_mul(2),
-                    )
+                    units
                 }
                 Value::Number(number) => 1_u64.saturating_add(number.magnitude_byte_len()),
                 Value::Null | Value::Bool(_) | Value::Undefined => 1,
-            });
+            };
+            total = total.saturating_add(units);
+            if total > cap {
+                return u64::MAX;
+            }
         }
         total
+    }
+
+    fn comparison_projection(lhs: &Value, rhs: &Value) -> u64 {
+        Self::value_structure_projection_capped(lhs, Self::STRUCTURE_PROJECTION_CAP)
+            .saturating_add(Self::value_structure_projection_capped(
+                rhs,
+                Self::STRUCTURE_PROJECTION_CAP,
+            ))
+            .max(1)
+    }
+
+    fn charge_comparison(&mut self, lhs: &Value, rhs: &Value) -> Result<()> {
+        self.consume_semantic_work_n(Self::comparison_projection(lhs, rhs))
+    }
+
+    fn btree_lookup_projection(needle: &Value, collection: &Value, len: usize) -> u64 {
+        // BTree comparator instrumentation is unavailable. At most every stored value can be
+        // compared, and the collection projection bounds every compared value.
+        u64::try_from(len)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(Self::comparison_projection(needle, collection))
+            .max(1)
+    }
+
+    fn set_operator_projection(lhs: &Value, rhs: &Value) -> u64 {
+        let entries = match (lhs, rhs) {
+            (Value::Set(lhs), Value::Set(rhs)) => lhs.len().saturating_add(rhs.len()),
+            _ => return 1,
+        };
+        let operands = Self::comparison_projection(lhs, rhs);
+        // Bound merge comparisons by all input entries, then reserve another operand-sized bound
+        // for the worst-case result. The actual result is charged again after construction.
+        u64::try_from(entries)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1)
+            .saturating_mul(operands)
     }
 
     fn values_structure_projection(values: &[Value]) -> u64 {
@@ -1252,6 +1312,7 @@ impl Interpreter {
             return Ok(Value::Undefined);
         }
 
+        self.charge_comparison(&lhs, &rhs)?;
         builtins::comparison::compare(op, &lhs, &rhs)
     }
 
@@ -1263,10 +1324,13 @@ impl Interpreter {
             return Ok(Value::Undefined);
         }
 
-        match op {
-            BinOp::Union => builtins::sets::union(lhs, rhs, lhs_value, rhs_value),
-            BinOp::Intersection => builtins::sets::intersection(lhs, rhs, lhs_value, rhs_value),
-        }
+        self.consume_semantic_work_n(Self::set_operator_projection(&lhs_value, &rhs_value))?;
+        let result = match op {
+            BinOp::Union => builtins::sets::union(lhs, rhs, lhs_value, rhs_value)?,
+            BinOp::Intersection => builtins::sets::intersection(lhs, rhs, lhs_value, rhs_value)?,
+        };
+        self.charge_value_structure(&result)?;
+        Ok(result)
     }
 
     fn eval_arith_expr(
@@ -1292,7 +1356,12 @@ impl Interpreter {
 
         match (op, &lhs_value, &rhs_value) {
             (ArithOp::Sub, Value::Set(_), _) | (ArithOp::Sub, _, Value::Set(_)) => {
-                builtins::sets::difference(lhs, rhs, lhs_value, rhs_value)
+                self.consume_semantic_work_n(Self::set_operator_projection(
+                    &lhs_value, &rhs_value,
+                ))?;
+                let result = builtins::sets::difference(lhs, rhs, lhs_value, rhs_value)?;
+                self.charge_value_structure(&result)?;
+                Ok(result)
             }
             _ => builtins::numbers::arithmetic_operation(
                 span,
@@ -1384,14 +1453,6 @@ impl Interpreter {
             return Ok(Value::Undefined);
         }
 
-        fn compare(v1: &Value, v2: &Value) -> Result<Value> {
-            if v1 != v2 || v1 == &Value::Undefined {
-                Ok(Value::Undefined)
-            } else {
-                Ok(Value::from(true))
-            }
-        }
-
         match plan {
             DestructuringPlan::Var(var_name) => {
                 // Bind the variable to the value
@@ -1403,10 +1464,18 @@ impl Interpreter {
 
             DestructuringPlan::EqualityExpr(expected_expr) => {
                 let expected = self.eval_expr(expected_expr)?;
-                compare(value, &expected)
+                self.charge_comparison(value, &expected)?;
+                if value != &expected || value == &Value::Undefined {
+                    Ok(Value::Undefined)
+                } else {
+                    Ok(Value::from(true))
+                }
             }
 
-            DestructuringPlan::EqualityValue(expected) => Ok(Value::from(value == expected)),
+            DestructuringPlan::EqualityValue(expected) => {
+                self.charge_comparison(value, expected)?;
+                Ok(Value::from(value == expected))
+            }
 
             DestructuringPlan::Array { element_plans } => {
                 // Value must be an array with matching length
@@ -1441,6 +1510,11 @@ impl Interpreter {
                 if let Value::Object(obj) = value {
                     // Check that all required fields are present and match
                     for (key, field_plan) in field_plans {
+                        self.consume_semantic_work_n(Self::btree_lookup_projection(
+                            key,
+                            value,
+                            obj.len(),
+                        ))?;
                         if let Some(field_value) = obj.get(key) {
                             if self.execute_destructuring_plan(field_plan, field_value)?
                                 != Value::from(true)
@@ -1459,6 +1533,11 @@ impl Interpreter {
                                 return Ok(Value::Undefined);
                             }
 
+                            self.consume_semantic_work_n(Self::btree_lookup_projection(
+                                &key_value,
+                                value,
+                                obj.len(),
+                            ))?;
                             if let Some(field_value) = obj.get(&key_value) {
                                 if self.execute_destructuring_plan(field_plan, field_value)?
                                     != Value::from(true)
@@ -1558,6 +1637,7 @@ impl Interpreter {
                     return Ok(Value::Undefined);
                 }
 
+                self.charge_comparison(&lhs_value, &rhs_value)?;
                 if lhs_value == rhs_value {
                     Ok(Value::Bool(true))
                 } else {
@@ -2982,30 +3062,57 @@ impl Interpreter {
             Value::Array(array) => {
                 if let Some(key) = key {
                     let key = self.eval_expr(key)?;
-                    collection[&key] == value
+                    let candidate = &collection[&key];
+                    self.charge_comparison(candidate, &value)?;
+                    candidate == &value
                 } else {
-                    array.contains(&value)
+                    self.charge_collection_setup()?;
+                    let mut found = false;
+                    for candidate in array.iter() {
+                        self.charge_iteration_value(candidate)?;
+                        self.charge_comparison(candidate, &value)?;
+                        if candidate == &value {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
                 }
             }
             Value::Object(object) => {
                 if let Some(key) = key {
                     let key = self.eval_expr(key)?;
-                    collection[&key] == value
+                    self.consume_semantic_work_n(Self::btree_lookup_projection(
+                        &key,
+                        &collection,
+                        object.len(),
+                    ))?;
+                    let candidate = &collection[&key];
+                    self.charge_comparison(candidate, &value)?;
+                    candidate == &value
                 } else {
-                    object.values().any(|item| *item == value)
+                    self.charge_collection_setup()?;
+                    let mut found = false;
+                    for (entry_key, candidate) in object.iter_sorted() {
+                        self.charge_iteration_entry(entry_key, candidate)?;
+                        self.charge_comparison(candidate, &value)?;
+                        if candidate == &value {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
                 }
             }
-            Value::Set(set) => {
-                if key.is_some() {
-                    false
-                } else {
-                    set.contains(&value)
-                }
+            Value::Set(set) if key.is_none() => {
+                self.consume_semantic_work_n(Self::btree_lookup_projection(
+                    &value,
+                    &collection,
+                    set.len(),
+                ))?;
+                set.contains(&value)
             }
-            _ => {
-                false
-                //bail!(collection_expr.span().error("collection must be array, object or set"));
-            }
+            _ => false,
         };
 
         Ok(Value::Bool(result))
@@ -3649,6 +3756,11 @@ impl Interpreter {
         }
 
         // all defined values should be the equal to the same value that should be returned
+        for pair in results.windows(2) {
+            if let [lhs, rhs] = pair {
+                self.charge_comparison(lhs, rhs)?;
+            }
+        }
         if results.windows(2).any(|w| matches!(w, [a, b] if a != b)) {
             return Err(span.source.error(
                 span.line,
@@ -3704,6 +3816,7 @@ impl Interpreter {
                 }
             } else {
                 let expected = self.eval_expr(last_param)?;
+                self.charge_comparison(&value, &expected)?;
                 Ok(Value::Bool(value == expected))
             }
         } else {

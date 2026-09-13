@@ -13,7 +13,11 @@ use core::fmt;
 /// shared-value unit instead of the full parent. Builtins charge argument-reference weights, a
 /// declared preflight projection, and the actual result weight. Regex projections saturatingly
 /// charge pattern² compilation, pattern × haystack search, and operation-specific output bounds.
-/// Arithmetic charges a magnitude-based projection before evaluation. A budgeted call is rejected
+/// Arithmetic charges a magnitude-based projection before evaluation. Equality and ordering charge a
+/// capped deep-structure projection before comparison. Array and object membership charge visited
+/// entries incrementally; set membership conservatively bounds tree comparisons. Set union,
+/// intersection, and difference charge comparison and worst-case allocation projections before
+/// execution, then charge the actual result. A budgeted call is rejected
 /// before dispatch when its builtin or extension has no declared estimator. Version 1 describes
 /// the unreleased accounting contract and can change until its first release.
 pub const EVALUATION_ACCOUNTING_VERSION: u32 = 1;

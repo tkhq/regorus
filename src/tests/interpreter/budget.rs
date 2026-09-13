@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::ToString as _;
 use alloc::sync::Arc;
@@ -516,5 +517,199 @@ fn regex_replacement_expansion_is_preflighted() -> Result<()> {
         .eval_rule("data.budget.answer".to_string())
         .expect_err("replacement expansion must be rejected before dispatch");
     assert_eq!(budget_error(&error).limit, 1_000_000);
+    Ok(())
+}
+
+#[test]
+fn repeated_large_array_membership_exhausts_before_scanning() -> Result<()> {
+    let mut engine = engine_with_policy(
+        "package budget\nanswer := [i | i := numbers.range(0, 1999)[_]; -1 in input]\n",
+    )?;
+    engine.set_input(Value::from_array((0..500_000).map(Value::from).collect()));
+    engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 100_000 });
+    let error = engine
+        .eval_rule("data.budget.answer".to_string())
+        .expect_err("membership scans must exhaust incrementally");
+    assert_eq!(budget_error(&error).limit, 100_000);
+    Ok(())
+}
+
+#[test]
+fn repeated_large_equality_is_rejected_by_capped_projection() -> Result<()> {
+    let mut engine = engine_with_policy(
+        "package budget\nanswer := [i | i := numbers.range(0, 1999)[_]; input == input]\n",
+    )?;
+    engine.set_input(Value::from("x".repeat(8 * 1024 * 1024)));
+    engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 100_000 });
+    let error = engine
+        .eval_rule("data.budget.answer".to_string())
+        .expect_err("deep equality must exhaust before comparing");
+    assert_eq!(budget_error(&error).limit, 100_000);
+    Ok(())
+}
+
+fn membership_input(values: &str, needle: &str) -> Result<Value> {
+    Value::from_json_str(&format!(r#"{{"values":{values},"needle":{needle}}}"#))
+}
+
+#[test]
+fn membership_charges_visited_array_and_object_values() -> Result<()> {
+    let array_policy = "package budget\nanswer := input.needle in input.values\n";
+    let nested = r#"{"payload":[1,2,3],"label":"needle"}"#;
+    let other = r#"{"payload":[0],"label":"other"}"#;
+    let absent = r#"{"payload":[1,2,3],"label":"absent"}"#;
+    let early = measured_work(
+        array_policy,
+        "data.budget.answer",
+        membership_input(&format!("[{nested},{other},{other}]"), nested)?,
+    )?;
+    let late = measured_work(
+        array_policy,
+        "data.budget.answer",
+        membership_input(&format!("[{other},{other},{nested}]"), nested)?,
+    )?;
+    let missing = measured_work(
+        array_policy,
+        "data.budget.answer",
+        membership_input(&format!("[{other},{other},{absent}]"), nested)?,
+    )?;
+    assert!(early < late && late <= missing);
+
+    let object_values = format!(r#"{{"a":{other},"b":{other},"c":{nested}}}"#);
+    let object_late = measured_work(
+        array_policy,
+        "data.budget.answer",
+        membership_input(&object_values, nested)?,
+    )?;
+    let object_early = measured_work(
+        array_policy,
+        "data.budget.answer",
+        membership_input(
+            &format!(r#"{{"a":{nested},"b":{other},"c":{other}}}"#),
+            nested,
+        )?,
+    )?;
+    assert!(object_early < object_late);
+    Ok(())
+}
+
+fn set_membership_input(size: usize, needle: Value) -> Value {
+    let values = (0..size).map(Value::from).collect::<BTreeSet<_>>();
+    Value::from_map(BTreeMap::from([
+        (Value::from("needle"), needle),
+        (Value::from("values"), Value::from_set(values)),
+    ]))
+}
+
+fn nested_set_membership_input(needle: &str) -> Result<Value> {
+    let values = ["alpha", "middle", "omega"]
+        .into_iter()
+        .map(|label| Value::from_json_str(&format!(r#"{{"label":"{label}","items":[1,2,3]}}"#)))
+        .collect::<Result<BTreeSet<_>>>()?;
+    Ok(Value::from_map(BTreeMap::from([
+        (
+            Value::from("needle"),
+            Value::from_json_str(&format!(r#"{{"label":"{needle}","items":[1,2,3]}}"#))?,
+        ),
+        (Value::from("values"), Value::from_set(values)),
+    ])))
+}
+
+#[test]
+fn nested_set_membership_is_conservative_for_all_lookup_positions() -> Result<()> {
+    let policy = "package budget\nanswer := input.needle in input.values\n";
+    let early = measured_work(
+        policy,
+        "data.budget.answer",
+        nested_set_membership_input("alpha")?,
+    )?;
+    let late = measured_work(
+        policy,
+        "data.budget.answer",
+        nested_set_membership_input("omega")?,
+    )?;
+    let missing = measured_work(
+        policy,
+        "data.budget.answer",
+        nested_set_membership_input("missing")?,
+    )?;
+    assert!(early <= late && late <= missing);
+    Ok(())
+}
+
+#[test]
+fn set_membership_bounds_btree_comparisons_deterministically() -> Result<()> {
+    let policy = "package budget\nanswer := input.needle in input.values\n";
+    let present = measured_work(
+        policy,
+        "data.budget.answer",
+        set_membership_input(64, Value::from(63)),
+    )?;
+    let absent = measured_work(
+        policy,
+        "data.budget.answer",
+        set_membership_input(64, Value::from(65)),
+    )?;
+    assert_eq!(present, absent);
+
+    let mut engine = engine_with_policy(policy)?;
+    engine.set_input(set_membership_input(100_000, Value::from(-1)));
+    engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 100_000 });
+    engine
+        .eval_rule("data.budget.answer".to_string())
+        .expect_err("large BTree membership must exhaust before lookup");
+    Ok(())
+}
+
+#[test]
+fn comparison_projection_covers_value_kinds_and_long_prefixes() -> Result<()> {
+    let policy = "package budget\nanswer := input.left == input.right\n";
+    for input in [
+        r#"{"left":"aaaaaaaaaaaaaaaaX","right":"aaaaaaaaaaaaaaaaY"}"#,
+        r#"{"left":[1,2,{"x":"long"}],"right":[1,2,{"x":"long"}]}"#,
+        r#"{"left":{"a":[1,2],"b":true},"right":{"a":[1,2],"b":true}}"#,
+        r#"{"left":340282366920938463463374607431768211456,"right":340282366920938463463374607431768211456}"#,
+    ] {
+        measured_work(policy, "data.budget.answer", Value::from_json_str(input)?)?;
+    }
+
+    let set = Value::from_set(
+        [Value::from("long-prefix"), Value::from(1)]
+            .into_iter()
+            .collect(),
+    );
+    let input = Value::from_map(BTreeMap::from([
+        (Value::from("left"), set.clone()),
+        (Value::from("right"), set),
+    ]));
+    measured_work(policy, "data.budget.answer", input)?;
+    Ok(())
+}
+
+fn set_operator_input(size: usize) -> Value {
+    let left = (0..size).map(Value::from).collect::<BTreeSet<_>>();
+    let right = (size / 2..size.saturating_add(size / 2))
+        .map(Value::from)
+        .collect::<BTreeSet<_>>();
+    Value::from_map(BTreeMap::from([
+        (Value::from("left"), Value::from_set(left)),
+        (Value::from("right"), Value::from_set(right)),
+    ]))
+}
+
+#[test]
+fn set_operators_preflight_work_and_result_allocation() -> Result<()> {
+    for operator in ["|", "&", "-"] {
+        let policy = format!("package budget\nanswer := input.left {operator} input.right\n");
+        measured_work(&policy, "data.budget.answer", set_operator_input(4))?;
+
+        let mut engine = engine_with_policy(&policy)?;
+        engine.set_input(set_operator_input(100_000));
+        engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 100_000 });
+        let error = engine
+            .eval_rule("data.budget.answer".to_string())
+            .expect_err("large set work must exhaust before result allocation");
+        assert_eq!(budget_error(&error).limit, 100_000);
+    }
     Ok(())
 }
