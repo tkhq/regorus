@@ -16,7 +16,8 @@ use core::fmt;
 /// Arithmetic charges a magnitude-based projection before evaluation. Equality and ordering charge
 /// corresponding structure up to the smaller operand, capped at the current remaining budget plus
 /// one. Membership scans charge visited slots and comparisons; BTree lookup charges
-/// `(ceil(log2(n)) + 1) * needle comparison bound`. Set operators charge input traversal,
+/// `11 * (ceil(log2(n)) + 1) * needle comparison bound`, covering every key in a Rust BTree
+/// node with `B = 6`. Set operators charge input traversal,
 /// `(n + m) * ceil(log2(n + m + 1)) * maximum element comparison bound`, and worst-case
 /// result structure before execution, then charge the actual result. A budgeted call is rejected
 /// before dispatch when its builtin or extension has no declared estimator. Version 1 describes

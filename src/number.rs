@@ -449,8 +449,17 @@ impl PartialEq for Number {
             axiom_f64_obeys_eq_spec();
         }
 
-        if let (Some(a), Some(b)) = (self.to_bigint_owned(), other.to_bigint_owned()) {
-            return a == b;
+        let integers_equal = match (self, other) {
+            (Number::BigInt(a), Number::BigInt(b)) => Some(a.as_ref() == b.as_ref()),
+            (Number::BigInt(a), b) => b.to_bigint_owned().map(|b| a.as_ref() == &b),
+            (a, Number::BigInt(b)) => a.to_bigint_owned().map(|a| &a == b.as_ref()),
+            (a, b) => a
+                .to_bigint_owned()
+                .zip(b.to_bigint_owned())
+                .map(|(a, b)| a == b),
+        };
+        if let Some(equal) = integers_equal {
+            return equal;
         }
 
         let a = self.to_f64_lossy();
@@ -487,8 +496,17 @@ impl Ord for Number {
             axiom_f64_obeys_partial_cmp_spec();
             axiom_bigint_obeys_cmp_spec();
         }
-        if let (Some(a), Some(b)) = (self.to_bigint_owned(), other.to_bigint_owned()) {
-            return a.cmp(&b);
+        let integer_order = match (self, other) {
+            (Number::BigInt(a), Number::BigInt(b)) => Some(a.as_ref().cmp(b.as_ref())),
+            (Number::BigInt(a), b) => b.to_bigint_owned().map(|b| a.as_ref().cmp(&b)),
+            (a, Number::BigInt(b)) => a.to_bigint_owned().map(|a| a.cmp(b.as_ref())),
+            (a, b) => a
+                .to_bigint_owned()
+                .zip(b.to_bigint_owned())
+                .map(|(a, b)| a.cmp(&b)),
+        };
+        if let Some(order) = integer_order {
+            return order;
         }
 
         self.to_f64_lossy()
@@ -1692,6 +1710,20 @@ mod tests {
             .modulo(&Number::Int(-1))
             .expect("modulo should succeed");
         assert_eq!(remainder.as_i64(), Some(0));
+    }
+
+    #[test]
+    fn huge_bigint_comparisons_borrow_large_operands() {
+        let huge = Rc::new(BigInt::one() << 819_200_usize);
+        let equal = Rc::new(huge.as_ref().clone());
+        let (huge, equal, small) = (Number::BigInt(huge), Number::BigInt(equal), Number::Int(-1));
+        for _ in 0..4_096 {
+            assert_eq!(huge.cmp(&small), Ordering::Greater);
+            assert_ne!(huge, small);
+            assert_eq!(huge.cmp(&equal), Ordering::Equal);
+            assert_eq!(huge, equal);
+            core::hint::black_box((&huge, &equal));
+        }
     }
 
     #[test]

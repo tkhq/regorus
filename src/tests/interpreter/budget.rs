@@ -10,8 +10,9 @@ use alloc::{vec, vec::Vec};
 use anyhow::Result;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::number::{BigInt, Number};
 use crate::utils::limits::{EvaluationBudgetConfig, EvaluationBudgetError};
-use crate::{Engine, Value};
+use crate::{Engine, Rc, Value};
 
 fn engine_with_policy(policy: &str) -> Result<Engine> {
     let mut engine = Engine::new();
@@ -585,6 +586,33 @@ fn unequal_large_values_and_small_needles_remain_payable() -> Result<()> {
     );
     for collection in [array, object, set] {
         assert!(budgeted_work(policy, collection, 1_000)? < 1_000);
+    }
+    Ok(())
+}
+
+#[allow(clippy::arithmetic_side_effects)]
+fn huge_bigint_value() -> Value {
+    Value::from(Number::BigInt(Rc::new(BigInt::from(1_u8) << 819_200_usize)))
+}
+
+#[test]
+fn nested_bigint_comparisons_scale_with_charged_work() -> Result<()> {
+    let huge = huge_bigint_value();
+    let array = Value::from_array(core::iter::repeat_n(huge.clone(), 8).collect());
+    let object = Value::from_map((0..8).map(|i| (Value::from(i), huge.clone())).collect());
+    let set = Value::from_set([huge].into_iter().collect());
+    let membership =
+        "package budget\nanswer := [i | i := numbers.range(0, 1999)[_]; -1 in input]\n";
+    for collection in [array.clone(), object.clone(), set.clone()] {
+        assert!(budgeted_work(membership, collection, 1_000_000)? < 1_000_000);
+    }
+    let equality = "package budget\nanswer := input.left == input.right\n";
+    for collection in [array, object, set] {
+        let input = Value::from_map(BTreeMap::from([
+            (Value::from("left"), collection.clone()),
+            (Value::from("right"), collection),
+        ]));
+        assert!(budgeted_work(equality, input, 1_000_000)? < 1_000_000);
     }
     Ok(())
 }

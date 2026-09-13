@@ -161,7 +161,8 @@ impl Engine {
     /// charge argument references, operation-specific preflight work, and full result structure.
     /// Number weights include binary magnitude bytes, and arithmetic is precharged from magnitudes.
     /// Comparisons project corresponding structure up to the smaller operand and stop at the
-    /// current remaining budget plus one. BTree lookup uses a logarithmic comparison bound. Set
+    /// current remaining budget plus one. BTree lookup bounds 11 key comparisons per level for
+    /// Rust BTree nodes with `B = 6`. Set
     /// operators precharge input traversal, comparator work, and worst-case result allocation.
     /// A budgeted builtin or extension without a declared estimator is rejected before dispatch.
     /// Compound

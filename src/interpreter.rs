@@ -512,11 +512,17 @@ impl Interpreter {
         }
     }
 
+    // alloc::collections::BTreeMap uses B = 6: at most 2 * B - 1 = 11 keys per node.
+    // Binary-tree height is a conservative upper bound on BTree height.
+    const BTREE_MAX_KEYS_PER_NODE: u64 = 11;
+
     fn btree_comparison_count(len: usize) -> u64 {
-        Self::ceil_log2(len).saturating_add(1)
+        Self::ceil_log2(len)
+            .saturating_add(1)
+            .saturating_mul(Self::BTREE_MAX_KEYS_PER_NODE)
     }
 
-    // Account for ceil(log2(n)) + 1 comparisons bounded by the lookup needle.
+    // Account for every key comparison in every potentially visited BTree node.
     fn btree_lookup_projection(&self, needle: &Value, len: usize) -> u64 {
         let bound = Self::value_structure_projection_capped(needle, self.projection_cap())
             .saturating_add(1);
