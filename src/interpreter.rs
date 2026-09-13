@@ -15,7 +15,10 @@ use crate::lexer::*;
 use crate::lookup::Lookup;
 use crate::parser::Parser;
 use crate::scheduler::*;
-use crate::utils::limits::{monotonic_now, ExecutionTimer, ExecutionTimerConfig};
+use crate::utils::limits::{
+    monotonic_now, EvaluationBudget, EvaluationBudgetConfig, EvaluationMetrics, ExecutionTimer,
+    ExecutionTimerConfig,
+};
 #[cfg(feature = "std")]
 use crate::utils::*;
 #[cfg(not(feature = "std"))]
@@ -112,6 +115,7 @@ pub struct Interpreter {
     builtins_cache: BTreeMap<(&'static str, Vec<Value>), Value>,
     no_rules_lookup: bool,
     execution_timer: ExecutionTimer,
+    evaluation_budget: EvaluationBudget,
 }
 
 impl Default for Interpreter {
@@ -160,6 +164,7 @@ impl Clone for Interpreter {
             module: None,
             no_rules_lookup: false,
             execution_timer: ExecutionTimer::new(self.execution_timer.config()),
+            evaluation_budget: EvaluationBudget::new(self.evaluation_budget.config()),
         }
     }
 }
@@ -241,6 +246,7 @@ impl Interpreter {
             gather_prints: false,
             prints: Vec::default(),
             execution_timer: ExecutionTimer::new(None),
+            evaluation_budget: EvaluationBudget::new(None),
         }
     }
 
@@ -285,6 +291,7 @@ impl Interpreter {
                 .clone()
                 .unwrap_or_else(Value::new_object),
             execution_timer: ExecutionTimer::new(None),
+            evaluation_budget: EvaluationBudget::new(None),
         }
     }
 
@@ -312,8 +319,746 @@ impl Interpreter {
     }
 
     #[inline]
+    fn consume_semantic_work(&mut self) -> Result<()> {
+        self.consume_semantic_work_n(1)
+    }
+
+    #[inline]
+    fn consume_semantic_work_n(&mut self, units: u64) -> Result<()> {
+        self.evaluation_budget
+            .consume_n(units)
+            .map_err(anyhow::Error::new)
+    }
+
+    fn charge_value_structure(&mut self, root: &Value) -> Result<u64> {
+        let mut total = 0_u64;
+        let mut pending = vec![root];
+        while let Some(value) = pending.pop() {
+            let units = match value {
+                Value::String(value) => {
+                    1_u64.saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX))
+                }
+                Value::Array(values) => {
+                    let units =
+                        1_u64.saturating_add(u64::try_from(values.len()).unwrap_or(u64::MAX));
+                    self.consume_semantic_work_n(units)?;
+                    total = total.saturating_add(units);
+                    pending.extend(values.iter().rev());
+                    continue;
+                }
+                Value::Set(values) => {
+                    let units =
+                        1_u64.saturating_add(u64::try_from(values.len()).unwrap_or(u64::MAX));
+                    self.consume_semantic_work_n(units)?;
+                    total = total.saturating_add(units);
+                    pending.extend(values.iter_sorted().rev());
+                    continue;
+                }
+                Value::Object(values) => {
+                    let units = 1_u64.saturating_add(
+                        (u64::try_from(values.len()).unwrap_or(u64::MAX)).saturating_mul(2),
+                    );
+                    self.consume_semantic_work_n(units)?;
+                    total = total.saturating_add(units);
+                    for (key, child_value) in values.iter_sorted().rev() {
+                        pending.push(child_value);
+                        pending.push(key);
+                    }
+                    continue;
+                }
+                Value::Number(number) => 1_u64.saturating_add(number.magnitude_byte_len()),
+                Value::Null | Value::Bool(_) | Value::Undefined => 1,
+            };
+            self.consume_semantic_work_n(units)?;
+            total = total.saturating_add(units);
+        }
+        Ok(total)
+    }
+
+    fn reference_weight(value: &Value) -> u64 {
+        match value {
+            Value::Number(number) => 1_u64.saturating_add(number.magnitude_byte_len()),
+            _ => 1,
+        }
+    }
+
+    fn charge_value_reference(&mut self, value: Value) -> Result<Value> {
+        self.consume_semantic_work_n(Self::reference_weight(&value))?;
+        Ok(value)
+    }
+
+    fn charge_values_reference(&mut self, values: &[Value]) -> Result<()> {
+        let units = values.iter().fold(0_u64, |total, value| {
+            total.saturating_add(Self::reference_weight(value))
+        });
+        self.consume_semantic_work_n(units)?;
+        Ok(())
+    }
+
+    fn projection_cap(&self) -> u64 {
+        self.evaluation_budget
+            .remaining()
+            .map_or(u64::MAX, |remaining| remaining.saturating_add(1))
+    }
+
+    fn value_structure_projection(root: &Value) -> u64 {
+        Self::value_structure_projection_capped(root, u64::MAX)
+    }
+
+    fn value_structure_projection_capped(root: &Value, cap: u64) -> u64 {
+        let mut total = 0_u64;
+        let mut pending = vec![root];
+        while let Some(value) = pending.pop() {
+            let units = match value {
+                Value::String(value) => {
+                    1_u64.saturating_add(value.len().try_into().unwrap_or(u64::MAX))
+                }
+                Value::Array(values) => {
+                    1_u64.saturating_add(values.len().try_into().unwrap_or(u64::MAX))
+                }
+                Value::Set(values) => {
+                    1_u64.saturating_add(values.len().try_into().unwrap_or(u64::MAX))
+                }
+                Value::Object(values) => 1_u64.saturating_add(
+                    u64::try_from(values.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(2),
+                ),
+                Value::Number(number) => 1_u64.saturating_add(number.magnitude_byte_len()),
+                Value::Null | Value::Bool(_) | Value::Undefined => 1,
+            };
+            total = total.saturating_add(units);
+            if total >= cap {
+                return cap;
+            }
+            match value {
+                Value::Array(values) => pending.extend(values.iter()),
+                Value::Set(values) => pending.extend(values.iter_sorted()),
+                Value::Object(values) => {
+                    for (key, child_value) in values.iter_sorted() {
+                        pending.push(key);
+                        pending.push(child_value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        total
+    }
+
+    // Traverse corresponding structure only. This bounds lexicographic comparison by the smaller
+    // operand and stops before projection work can exceed a finite remaining budget.
+    fn comparison_projection(root_lhs: &Value, root_rhs: &Value, cap: u64) -> u64 {
+        let mut total = 0_u64;
+        let mut pending = vec![(root_lhs, root_rhs)];
+        while let Some((lhs, rhs)) = pending.pop() {
+            let units = match (lhs, rhs) {
+                (Value::String(lhs), Value::String(rhs)) => {
+                    1_u64.saturating_add(lhs.len().min(rhs.len()).try_into().unwrap_or(u64::MAX))
+                }
+                (Value::Number(lhs), Value::Number(rhs)) => {
+                    1_u64.saturating_add(lhs.magnitude_byte_len().min(rhs.magnitude_byte_len()))
+                }
+                (Value::Array(lhs), Value::Array(rhs)) => {
+                    let len = lhs.len().min(rhs.len());
+                    let units = 1_u64.saturating_add(len.try_into().unwrap_or(u64::MAX));
+                    if total.saturating_add(units) >= cap {
+                        return cap;
+                    }
+                    pending.extend(lhs.iter().zip(rhs.iter()));
+                    units
+                }
+                (Value::Set(lhs), Value::Set(rhs)) => {
+                    let len = lhs.len().min(rhs.len());
+                    let units = 1_u64.saturating_add(len.try_into().unwrap_or(u64::MAX));
+                    if total.saturating_add(units) >= cap {
+                        return cap;
+                    }
+                    pending.extend(lhs.iter_sorted().zip(rhs.iter_sorted()));
+                    units
+                }
+                (Value::Object(lhs), Value::Object(rhs)) => {
+                    let len = lhs.len().min(rhs.len());
+                    let units = 1_u64
+                        .saturating_add(u64::try_from(len).unwrap_or(u64::MAX).saturating_mul(2));
+                    if total.saturating_add(units) >= cap {
+                        return cap;
+                    }
+                    for ((lk, lv), (rk, rv)) in lhs.iter_sorted().zip(rhs.iter_sorted()) {
+                        pending.push((lk, rk));
+                        pending.push((lv, rv));
+                    }
+                    units
+                }
+                _ => 1,
+            };
+            total = total.saturating_add(units);
+            if total >= cap {
+                return cap;
+            }
+        }
+        total.max(1)
+    }
+
+    fn charge_comparison(&mut self, lhs: &Value, rhs: &Value) -> Result<()> {
+        self.consume_semantic_work_n(Self::comparison_projection(lhs, rhs, self.projection_cap()))
+    }
+
+    fn ceil_log2(len: usize) -> u64 {
+        if len <= 1 {
+            0
+        } else {
+            u64::from(usize::BITS.saturating_sub(len.saturating_sub(1).leading_zeros()))
+        }
+    }
+
+    // alloc::collections::BTreeMap uses B = 6: at most 2 * B - 1 = 11 keys per node.
+    // Binary-tree height is a conservative upper bound on BTree height.
+    const BTREE_MAX_KEYS_PER_NODE: u64 = 11;
+
+    fn btree_comparison_count(len: usize) -> u64 {
+        Self::ceil_log2(len)
+            .saturating_add(1)
+            .saturating_mul(Self::BTREE_MAX_KEYS_PER_NODE)
+    }
+
+    // Account for every key comparison in every potentially visited BTree node.
+    fn btree_lookup_projection(&self, needle: &Value, len: usize) -> u64 {
+        let bound = Self::value_structure_projection_capped(needle, self.projection_cap())
+            .saturating_add(1);
+        Self::btree_comparison_count(len).saturating_mul(bound)
+    }
+
+    fn set_operator_projection(&self, lhs: &Value, rhs: &Value) -> u64 {
+        let (lhs, rhs) = match (lhs, rhs) {
+            (Value::Set(lhs), Value::Set(rhs)) => (lhs, rhs),
+            _ => return 1,
+        };
+        let cap = self.projection_cap();
+        let mut input = 2_u64
+            .saturating_add(lhs.len().try_into().unwrap_or(u64::MAX))
+            .saturating_add(rhs.len().try_into().unwrap_or(u64::MAX));
+        let mut max_element = 1_u64;
+        for value in lhs.iter_sorted().chain(rhs.iter_sorted()) {
+            let weight = Self::value_structure_projection_capped(value, cap);
+            input = input.saturating_add(weight);
+            max_element = max_element.max(weight.saturating_add(1));
+            if input >= cap {
+                return cap;
+            }
+        }
+        let entries = lhs.len().saturating_add(rhs.len());
+        // BTreeSet algebra exposes sorted adapters, but collecting the result may insert into a
+        // BTreeSet. Bound that path by logarithmic comparisons for every possible output entry.
+        let comparisons = u64::try_from(entries)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(Self::ceil_log2(entries.saturating_add(1)))
+            .saturating_mul(max_element);
+        // Input traversal plus a worst-case result equal to both inputs.
+        input.saturating_mul(2).saturating_add(comparisons).min(cap)
+    }
+
+    fn values_structure_projection(values: &[Value]) -> u64 {
+        values.iter().fold(0_u64, |total, value| {
+            total.saturating_add(Self::value_structure_projection(value))
+        })
+    }
+
+    // Collection accounting is 1 unit for setup, then 1 + element weight for each visited
+    // array/set element, or 2 + key/value weights for each visited object entry. A complete
+    // traversal equals the structural weight, while early exit pays only for visited structure.
+    fn charge_collection_setup(&mut self) -> Result<()> {
+        self.consume_semantic_work()
+    }
+
+    fn charge_iteration_value(&mut self, value: &Value) -> Result<()> {
+        self.consume_semantic_work()?;
+        self.charge_value_structure(value).map(|_| ())
+    }
+
+    fn charge_iteration_entry(&mut self, key: &Value, value: &Value) -> Result<()> {
+        self.consume_semantic_work_n(2)?;
+        self.charge_value_structure(key)?;
+        self.charge_value_structure(value).map(|_| ())
+    }
+
+    fn range_projection(args: &[Value], step_index: Option<usize>) -> u64 {
+        let Some(Value::Number(start)) = args.first() else {
+            return 1;
+        };
+        let Some(Value::Number(end)) = args.get(1) else {
+            return 1;
+        };
+        let (Some(start), Some(end)) = (start.as_i64(), end.as_i64()) else {
+            return u64::MAX;
+        };
+        let distance = start.abs_diff(end);
+        let step = step_index
+            .and_then(|index| args.get(index))
+            .and_then(|value| match value {
+                Value::Number(number) => number.as_u64(),
+                _ => None,
+            })
+            .unwrap_or(1);
+        if step == 0 {
+            return 1;
+        }
+        let elements = distance
+            .checked_div(step)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        1_u64.saturating_add(elements.saturating_mul(2))
+    }
+
+    fn cidr_expand_projection(args: &[Value]) -> u64 {
+        let Some(Value::String(cidr)) = args.first() else {
+            return 1;
+        };
+        let Some((address, prefix)) = cidr.rsplit_once('/') else {
+            return 1;
+        };
+        let Ok(prefix) = prefix.parse::<u32>() else {
+            return 1;
+        };
+        let Ok(address) = address.parse::<core::net::IpAddr>() else {
+            return 1;
+        };
+        let address_bits: u32 = if address.is_ipv6() { 128 } else { 32 };
+        let Some(host_bits) = address_bits.checked_sub(prefix) else {
+            return 1;
+        };
+        let hosts = 1_u64.checked_shl(host_bits).unwrap_or(u64::MAX);
+        // Each result is an array element and an IP string of at most 39 bytes.
+        1_u64.saturating_add(hosts.saturating_mul(41))
+    }
+
+    fn azure_range_projection(args: &[Value]) -> u64 {
+        let count = args
+            .get(1)
+            .and_then(|value| match value {
+                Value::Number(value) => value.as_u64(),
+                _ => None,
+            })
+            .unwrap_or(0);
+        1_u64.saturating_add(count.saturating_mul(2))
+    }
+
+    fn azure_pad_left_projection(args: &[Value]) -> u64 {
+        let width = args
+            .get(1)
+            .and_then(|value| match value {
+                Value::Number(value) => value.as_u64(),
+                Value::String(value) => value.parse::<u64>().ok(),
+                _ => None,
+            })
+            .unwrap_or(0);
+        // A Unicode padding character occupies at most four UTF-8 bytes.
+        1_u64.saturating_add(width.saturating_mul(4))
+    }
+
+    fn replacement_projection(args: &[Value]) -> u64 {
+        let input = args
+            .first()
+            .and_then(|value| match value {
+                Value::String(value) => Some(u64::try_from(value.len()).unwrap_or(u64::MAX)),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let replacement = args
+            .get(2)
+            .and_then(|value| match value {
+                Value::String(value) => Some(u64::try_from(value.len()).unwrap_or(u64::MAX)),
+                _ => None,
+            })
+            .unwrap_or(0);
+        1_u64
+            .saturating_add(replacement)
+            .saturating_add(input.saturating_mul(replacement.saturating_add(1)))
+    }
+
+    fn shift_projection(args: &[Value]) -> u64 {
+        let value_bytes = args
+            .first()
+            .and_then(|value| match value {
+                Value::Number(number) => Some(number.magnitude_byte_len()),
+                _ => None,
+            })
+            .unwrap_or(1);
+        let shift = args
+            .get(1)
+            .and_then(|value| match value {
+                Value::Number(number) => number.as_u64(),
+                _ => None,
+            })
+            .unwrap_or(u64::MAX);
+        value_bytes.saturating_add(shift.saturating_add(7).checked_div(8).unwrap_or(u64::MAX))
+    }
+
+    fn number_format_projection(args: &[Value]) -> u64 {
+        let Some(Value::Number(number)) = args.first() else {
+            return 1;
+        };
+        let bytes = number.magnitude_byte_len();
+        let bits = bytes.saturating_mul(8);
+        let digits = match args.get(1) {
+            Some(Value::Number(base)) => match base.as_u64() {
+                Some(2) => bits,
+                Some(8) => bits.saturating_add(2).checked_div(3).unwrap_or(u64::MAX),
+                Some(10) => bits
+                    .saturating_mul(30103)
+                    .saturating_add(99999)
+                    .checked_div(100000)
+                    .unwrap_or(u64::MAX),
+                Some(16) => bits.saturating_add(3).checked_div(4).unwrap_or(u64::MAX),
+                _ => 1,
+            },
+            _ => 1,
+        };
+        bytes
+            .saturating_mul(bytes)
+            .saturating_add(digits)
+            .saturating_add(1)
+    }
+
+    fn decimal_exponent_projection(args: &[Value], linear: u64) -> u64 {
+        let exponent = args
+            .first()
+            .and_then(|value| match value {
+                Value::String(value) => value.rsplit_once(['e', 'E']).map(|(_, exponent)| exponent),
+                _ => None,
+            })
+            .map(|exponent| {
+                let digits = exponent
+                    .strip_prefix(['+', '-'])
+                    .unwrap_or(exponent)
+                    .bytes()
+                    .take_while(u8::is_ascii_digit);
+                digits.fold(0_u64, |value, digit| {
+                    value
+                        .saturating_mul(10)
+                        .saturating_add(u64::from(digit.saturating_sub(b'0')))
+                })
+            })
+            .unwrap_or(0);
+        linear.saturating_mul(linear).saturating_add(exponent)
+    }
+
+    fn sprintf_projection(args: &[Value], linear: u64) -> u64 {
+        let Some(Value::String(format)) = args.first() else {
+            return linear;
+        };
+        let bytes = format.as_bytes();
+        let mut index = 0;
+        let mut expansion = 0_u64;
+        while index < bytes.len() {
+            if bytes.get(index) != Some(&b'%') {
+                index = index.saturating_add(1);
+                continue;
+            }
+            index = index.saturating_add(1);
+            if bytes.get(index) == Some(&b'%') {
+                index = index.saturating_add(1);
+                continue;
+            }
+            if bytes.get(index) == Some(&b'.') {
+                index = index.saturating_add(1);
+            }
+            let mut width = 0_u64;
+            while let Some(digit) = bytes.get(index).and_then(|byte| byte.checked_sub(b'0')) {
+                if digit > 9 {
+                    break;
+                }
+                width = width.saturating_mul(10).saturating_add(u64::from(digit));
+                index = index.saturating_add(1);
+            }
+            expansion = expansion.saturating_add(width);
+            index = index.saturating_add(1);
+        }
+        linear.saturating_mul(linear).saturating_add(expansion)
+    }
+
+    fn arithmetic_projection(op: &ArithOp, lhs: &Value, rhs: &Value) -> u64 {
+        let (Value::Number(lhs), Value::Number(rhs)) = (lhs, rhs) else {
+            return 1;
+        };
+        let lhs = lhs.magnitude_byte_len();
+        let rhs = rhs.magnitude_byte_len();
+        match op {
+            ArithOp::Add | ArithOp::Sub => lhs.max(rhs).saturating_add(1),
+            ArithOp::Mul | ArithOp::Div | ArithOp::Mod => lhs
+                .saturating_mul(rhs)
+                .saturating_add(lhs)
+                .saturating_add(rhs),
+        }
+    }
+
+    // Rust regex search is O(pattern × haystack). Add pattern² compilation and
+    // operation-specific output bounds; every operation saturates on overflow.
+    fn regex_projection(name: &str, args: &[Value]) -> u64 {
+        let length = |index| {
+            args.get(index)
+                .and_then(|value| match value {
+                    Value::String(value) => Some(u64::try_from(value.len()).unwrap_or(u64::MAX)),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        };
+        if name == "regex.template_match" {
+            let template = length(0);
+            return template
+                .saturating_mul(template.saturating_add(length(1)))
+                .saturating_add(1);
+        }
+        let (pattern, haystack, replacement) = if name == "regex.replace" {
+            (length(1), length(0), length(2))
+        } else {
+            (length(0), length(1), 0)
+        };
+        let compile = pattern
+            .saturating_mul(pattern)
+            .saturating_add(pattern)
+            .saturating_add(1);
+        let search = pattern.max(1).saturating_mul(haystack);
+        let output = match name {
+            "regex.find_all_string_submatch_n" => search
+                .saturating_add(haystack)
+                .saturating_add(pattern)
+                .saturating_add(4),
+            "regex.find_n" | "regex.split" => haystack.saturating_mul(2).saturating_add(3),
+            "regex.replace" => haystack
+                .saturating_add(1)
+                .saturating_mul(replacement.saturating_add(pattern).saturating_add(2)),
+            _ => 1,
+        };
+        compile.saturating_add(search).saturating_add(output)
+    }
+
+    fn is_type_introspection(name: &str) -> bool {
+        matches!(
+            name,
+            "is_array"
+                | "is_boolean"
+                | "is_null"
+                | "is_number"
+                | "is_object"
+                | "is_set"
+                | "is_string"
+                | "type_name"
+        )
+    }
+
+    fn builtin_work_projection(name: &str, args: &[Value]) -> Option<u64> {
+        if Self::is_type_introspection(name) {
+            return Some(if name == "type_name" {
+                args.first().map_or(1, |value| {
+                    1_u64.saturating_add(
+                        builtins::types::get_type(value)
+                            .len()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
+                    )
+                })
+            } else {
+                1
+            });
+        }
+        let linear = || Self::values_structure_projection(args).max(1);
+        let quadratic = || linear().saturating_mul(linear());
+        Some(match name {
+            "count" => match args.first() {
+                Some(Value::String(value)) => u64::try_from(value.len()).unwrap_or(u64::MAX),
+                Some(Value::Array(value)) => u64::try_from(value.len())
+                    .unwrap_or(u64::MAX)
+                    .max(1)
+                    .ilog2()
+                    .saturating_add(1)
+                    .into(),
+                Some(Value::Set(value)) => u64::try_from(value.len())
+                    .unwrap_or(u64::MAX)
+                    .max(1)
+                    .ilog2()
+                    .saturating_add(1)
+                    .into(),
+                Some(Value::Object(value)) => u64::try_from(value.len())
+                    .unwrap_or(u64::MAX)
+                    .max(1)
+                    .ilog2()
+                    .saturating_add(1)
+                    .into(),
+                _ => 1,
+            },
+            "object.get" => args.get(1).map_or(1, Self::value_structure_projection),
+            "numbers.range" => Self::range_projection(args, None),
+            "numbers.range_step" => Self::range_projection(args, Some(2)),
+            "net.cidr_expand" => Self::cidr_expand_projection(args),
+            "azure.policy.fn.range" => Self::azure_range_projection(args),
+            "azure.policy.fn.pad_left" => Self::azure_pad_left_projection(args),
+            "replace" => Self::replacement_projection(args),
+            "split" | "azure.policy.fn.split" => linear().saturating_mul(2),
+            "regex.find_all_string_submatch_n"
+            | "regex.find_n"
+            | "regex.is_valid"
+            | "regex.match"
+            | "regex.replace"
+            | "regex.split"
+            | "regex.template_match" => Self::regex_projection(name, args),
+            "sprintf" => Self::sprintf_projection(args, linear()),
+            "format_int" => Self::number_format_projection(args),
+            "bits.lsh" | "bits.rsh" => Self::shift_projection(args),
+            "to_number" | "units.parse" | "units.parse_bytes" => {
+                Self::decimal_exponent_projection(args, linear())
+            }
+            "concat" | "array.concat" | "azure.policy.fn.join" => quadratic(),
+            "base64.decode"
+            | "base64.encode"
+            | "base64url.decode"
+            | "base64url.encode"
+            | "base64url.encode_no_pad"
+            | "hex.decode"
+            | "hex.encode"
+            | "urlquery.decode"
+            | "urlquery.decode_object"
+            | "urlquery.encode"
+            | "urlquery.encode_object"
+            | "json.marshal"
+            | "azure.policy.fn.base64"
+            | "azure.policy.fn.base64_to_string"
+            | "azure.policy.fn.data_uri"
+            | "azure.policy.fn.data_uri_to_string"
+            | "azure.policy.fn.string"
+            | "azure.policy.fn.uri"
+            | "azure.policy.fn.uri_component"
+            | "azure.policy.fn.uri_component_to_string" => linear().saturating_mul(8),
+            "walk" | "graph.reachable" | "yaml.marshal" => quadratic(),
+            "array.reverse"
+            | "array.slice"
+            | "indexof_n"
+            | "object.filter"
+            | "object.keys"
+            | "object.remove"
+            | "object.union"
+            | "object.union_n"
+            | "json.patch"
+            | "json.remove"
+            | "sort"
+            | "intersection"
+            | "union"
+            | "__builtin_sets.intersection"
+            | "__builtin_sets.union"
+            | "azure.policy.fn.array"
+            | "azure.policy.fn.create_object"
+            | "azure.policy.fn.intersection"
+            | "azure.policy.fn.items"
+            | "azure.policy.fn.skip"
+            | "azure.policy.fn.take"
+            | "azure.policy.fn.union" => quadratic(),
+            "abs"
+            | "ceil"
+            | "floor"
+            | "round"
+            | "max"
+            | "min"
+            | "product"
+            | "sum"
+            | "bits.and"
+            | "bits.negate"
+            | "bits.or"
+            | "bits.xor"
+            | "contains"
+            | "endswith"
+            | "glob.match"
+            | "glob.quote_meta"
+            | "indexof"
+            | "lower"
+            | "net.cidr_contains"
+            | "net.cidr_is_valid"
+            | "object.subset"
+            | "semver.compare"
+            | "semver.is_valid"
+            | "startswith"
+            | "strings.any_prefix_match"
+            | "strings.any_suffix_match"
+            | "strings.count"
+            | "strings.reverse"
+            | "substring"
+            | "trace"
+            | "trim"
+            | "trim_left"
+            | "trim_prefix"
+            | "trim_right"
+            | "trim_space"
+            | "trim_suffix"
+            | "upper"
+            | "uuid.parse"
+            | "base64.is_valid"
+            | "time.add_date"
+            | "time.clock"
+            | "time.date"
+            | "time.diff"
+            | "time.format"
+            | "time.now_ns"
+            | "time.parse_duration_ns"
+            | "time.parse_ns"
+            | "time.parse_rfc3339_ns"
+            | "time.weekday"
+            | "azure.policy.fn.bool"
+            | "azure.policy.fn.coalesce"
+            | "azure.policy.fn.empty"
+            | "azure.policy.fn.ends_with"
+            | "azure.policy.fn.first"
+            | "azure.policy.fn.float"
+            | "azure.policy.fn.index_from_end"
+            | "azure.policy.fn.index_of"
+            | "azure.policy.fn.int"
+            | "azure.policy.fn.int_div"
+            | "azure.policy.fn.int_mod"
+            | "azure.policy.fn.last"
+            | "azure.policy.fn.last_index_of"
+            | "azure.policy.fn.max"
+            | "azure.policy.fn.min"
+            | "azure.policy.fn.starts_with"
+            | "azure.policy.fn.trim"
+            | "azure.policy.fn.try_get"
+            | "azure.policy.fn.try_index_from_end"
+            | "azure.policy.fn.date_time_add"
+            | "azure.policy.fn.date_time_from_epoch"
+            | "azure.policy.fn.date_time_to_epoch"
+            | "azure.policy.fn.add_days"
+            | "azure.policy.fn.ip_range_contains"
+            | "azure.policy.get_parameter"
+            | "azure.policy.if"
+            | "azure.policy.logic_all"
+            | "azure.policy.logic_any" => quadratic(),
+            // External I/O, runtime, schema, random, potentially exponential expansion, and test
+            // builtins do not have safe deterministic projections from their arguments. Budgeted
+            // evaluation rejects them.
+            _ => return None,
+        })
+    }
+
+    #[inline]
     fn check_execution_time(&mut self) -> Result<()> {
         self.execution_timer_tick(1)
+    }
+
+    #[inline]
+    fn check_execution_limits(&mut self) -> Result<()> {
+        self.check_execution_time()?;
+        self.consume_semantic_work()
+    }
+
+    fn propagate_budget_error<T>(result: Result<T>) -> Result<Option<T>> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(error)
+                if error
+                    .downcast_ref::<crate::EvaluationBudgetError>()
+                    .is_some() =>
+            {
+                Err(error)
+            }
+            Err(_) => Ok(None),
+        }
     }
 
     fn compiled_policy_mut(&mut self) -> &mut CompiledPolicyData {
@@ -381,6 +1126,18 @@ impl Interpreter {
         self.reset_execution_timer_state();
     }
 
+    pub const fn set_evaluation_budget_config(&mut self, config: Option<EvaluationBudgetConfig>) {
+        self.evaluation_budget = EvaluationBudget::new(config);
+    }
+
+    pub const fn evaluation_metrics(&self) -> EvaluationMetrics {
+        self.evaluation_budget.metrics()
+    }
+
+    pub const fn pause_evaluation_budget(&mut self) {
+        self.evaluation_budget.pause();
+    }
+
     pub fn set_input(&mut self, input: Value) {
         self.input = input.clone();
         // Update with_document["input"] too, in case if engine is being reused and was already prepared
@@ -410,6 +1167,7 @@ impl Interpreter {
         self.rule_values.clear();
         self.builtins_cache.clear();
         self.reset_execution_timer_state();
+        self.evaluation_budget.reset();
     }
 
     #[cfg(all(feature = "allocator-memory-limits", not(miri)))]
@@ -559,13 +1317,15 @@ impl Interpreter {
         loop {
             if let Some(v) = self.get_loop_var_value(expr)? {
                 path.reverse();
-                return Ok(Self::get_value_chained(v.clone(), &path[..]));
+                let value = Self::get_value_chained(v.clone(), &path[..]);
+                return self.charge_value_reference(value);
             }
             match expr.as_ref() {
                 // Stop path collection upon encountering the leading variable.
                 Expr::Var { span, .. } => {
                     path.reverse();
-                    return self.lookup_var(span, &path[..], false);
+                    let value = self.lookup_var(span, &path[..], false)?;
+                    return self.charge_value_reference(value);
                 }
                 // Accumulate chained . field accesses.
                 Expr::RefDot { refr, field, .. } => {
@@ -614,12 +1374,15 @@ impl Interpreter {
                             let index = index.to_string();
                             v = obj[index].clone();
                         }
-                        return Ok(Self::get_value_chained(v, &path[..]));
+                        let value = Self::get_value_chained(v, &path[..]);
+                        return self.charge_value_reference(value);
                     }
                 },
                 _ => {
                     path.reverse();
-                    return Ok(Self::get_value_chained(self.eval_expr(expr)?, &path[..]));
+                    let nested = self.eval_expr(expr)?;
+                    let value = Self::get_value_chained(nested, &path[..]);
+                    return self.charge_value_reference(value);
                 }
             }
         }
@@ -638,6 +1401,7 @@ impl Interpreter {
             return Ok(Value::Undefined);
         }
 
+        self.charge_comparison(&lhs, &rhs)?;
         builtins::comparison::compare(op, &lhs, &rhs)
     }
 
@@ -649,10 +1413,13 @@ impl Interpreter {
             return Ok(Value::Undefined);
         }
 
-        match op {
-            BinOp::Union => builtins::sets::union(lhs, rhs, lhs_value, rhs_value),
-            BinOp::Intersection => builtins::sets::intersection(lhs, rhs, lhs_value, rhs_value),
-        }
+        self.consume_semantic_work_n(self.set_operator_projection(&lhs_value, &rhs_value))?;
+        let result = match op {
+            BinOp::Union => builtins::sets::union(lhs, rhs, lhs_value, rhs_value)?,
+            BinOp::Intersection => builtins::sets::intersection(lhs, rhs, lhs_value, rhs_value)?,
+        };
+        self.charge_value_structure(&result)?;
+        Ok(result)
     }
 
     fn eval_arith_expr(
@@ -669,9 +1436,19 @@ impl Interpreter {
             return Ok(Value::Undefined);
         }
 
+        if !matches!(
+            (op, &lhs_value, &rhs_value),
+            (ArithOp::Sub, Value::Set(_), _) | (ArithOp::Sub, _, Value::Set(_))
+        ) {
+            self.consume_semantic_work_n(Self::arithmetic_projection(op, &lhs_value, &rhs_value))?;
+        }
+
         match (op, &lhs_value, &rhs_value) {
             (ArithOp::Sub, Value::Set(_), _) | (ArithOp::Sub, _, Value::Set(_)) => {
-                builtins::sets::difference(lhs, rhs, lhs_value, rhs_value)
+                self.consume_semantic_work_n(self.set_operator_projection(&lhs_value, &rhs_value))?;
+                let result = builtins::sets::difference(lhs, rhs, lhs_value, rhs_value)?;
+                self.charge_value_structure(&result)?;
+                Ok(result)
             }
             _ => builtins::numbers::arithmetic_operation(
                 span,
@@ -693,7 +1470,7 @@ impl Interpreter {
         domain: &ExprRef,
         query: &Ref<Query>,
     ) -> Result<bool> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         let domain = self.eval_expr(domain)?;
 
         self.scopes.push(Scope::new());
@@ -702,9 +1479,11 @@ impl Interpreter {
             ..Context::default()
         });
         let mut r = true;
+        self.charge_collection_setup()?;
         match domain {
             Value::Array(a) => {
                 for (idx, v) in a.iter().enumerate() {
+                    self.charge_iteration_value(v)?;
                     self.add_variable(&value.source_str(), v.clone())?;
                     if let Some(key) = key {
                         self.add_variable(&key.source_str(), Value::from(idx))?;
@@ -716,7 +1495,8 @@ impl Interpreter {
                 }
             }
             Value::Set(s) => {
-                for v in s.iter() {
+                for v in s.iter_sorted() {
+                    self.charge_iteration_value(v)?;
                     self.add_variable(&value.source_str(), v.clone())?;
                     if let Some(key) = key {
                         self.add_variable(&key.source_str(), v.clone())?;
@@ -728,7 +1508,8 @@ impl Interpreter {
                 }
             }
             Value::Object(o) => {
-                for (k, v) in o.iter() {
+                for (k, v) in o.iter_sorted() {
+                    self.charge_iteration_entry(k, v)?;
                     self.add_variable(&value.source_str(), v.clone())?;
                     if let Some(key) = key {
                         self.add_variable(&key.source_str(), k.clone())?;
@@ -754,17 +1535,9 @@ impl Interpreter {
         plan: &DestructuringPlan,
         value: &Value,
     ) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         if value == &Value::Undefined {
             return Ok(Value::Undefined);
-        }
-
-        fn compare(v1: &Value, v2: &Value) -> Result<Value> {
-            if v1 != v2 || v1 == &Value::Undefined {
-                Ok(Value::Undefined)
-            } else {
-                Ok(Value::from(true))
-            }
         }
 
         match plan {
@@ -778,10 +1551,18 @@ impl Interpreter {
 
             DestructuringPlan::EqualityExpr(expected_expr) => {
                 let expected = self.eval_expr(expected_expr)?;
-                compare(value, &expected)
+                self.charge_comparison(value, &expected)?;
+                if value != &expected || value == &Value::Undefined {
+                    Ok(Value::Undefined)
+                } else {
+                    Ok(Value::from(true))
+                }
             }
 
-            DestructuringPlan::EqualityValue(expected) => Ok(Value::from(value == expected)),
+            DestructuringPlan::EqualityValue(expected) => {
+                self.charge_comparison(value, expected)?;
+                Ok(Value::from(value == expected))
+            }
 
             DestructuringPlan::Array { element_plans } => {
                 // Value must be an array with matching length
@@ -816,6 +1597,7 @@ impl Interpreter {
                 if let Value::Object(obj) = value {
                     // Check that all required fields are present and match
                     for (key, field_plan) in field_plans {
+                        self.consume_semantic_work_n(self.btree_lookup_projection(key, obj.len()))?;
                         if let Some(field_value) = obj.get(key) {
                             if self.execute_destructuring_plan(field_plan, field_value)?
                                 != Value::from(true)
@@ -834,6 +1616,9 @@ impl Interpreter {
                                 return Ok(Value::Undefined);
                             }
 
+                            self.consume_semantic_work_n(
+                                self.btree_lookup_projection(&key_value, obj.len()),
+                            )?;
                             if let Some(field_value) = obj.get(&key_value) {
                                 if self.execute_destructuring_plan(field_plan, field_value)?
                                     != Value::from(true)
@@ -854,7 +1639,7 @@ impl Interpreter {
     }
 
     fn execute_assignment_plan(&mut self, plan: &AssignmentPlan) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         match plan {
             AssignmentPlan::ColonEquals {
                 lhs_expr: _,
@@ -933,6 +1718,7 @@ impl Interpreter {
                     return Ok(Value::Undefined);
                 }
 
+                self.charge_comparison(&lhs_value, &rhs_value)?;
                 if lhs_value == rhs_value {
                     Ok(Value::Bool(true))
                 } else {
@@ -950,7 +1736,7 @@ impl Interpreter {
         collection: &ExprRef,
         stmts: &[&LiteralStmt],
     ) -> Result<bool> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         let scope_saved = self.current_scope()?.clone();
         let mut count: usize = 0;
 
@@ -973,9 +1759,12 @@ impl Interpreter {
             bail!("internal error: missing binding plan for some..in expression");
         };
 
-        match self.eval_expr(collection)? {
+        let collection_value = self.eval_expr(collection)?;
+        self.charge_collection_setup()?;
+        match collection_value {
             Value::Array(a) => {
                 for (idx, value) in a.iter().enumerate() {
+                    self.charge_iteration_value(value)?;
                     *self.current_scope_mut()? = scope_saved.clone();
 
                     let mut success = if let Some(key_plan) = &key_plan {
@@ -1012,7 +1801,8 @@ impl Interpreter {
                 }
             }
             Value::Set(s) => {
-                for value in s.iter() {
+                for value in s.iter_sorted() {
+                    self.charge_iteration_value(value)?;
                     *self.current_scope_mut()? = scope_saved.clone();
 
                     let mut success = if let Some(key_plan) = &key_plan {
@@ -1049,7 +1839,8 @@ impl Interpreter {
             }
 
             Value::Object(o) => {
-                for (key, value) in o.iter() {
+                for (key, value) in o.iter_sorted() {
+                    self.charge_iteration_entry(key, value)?;
                     *self.current_scope_mut()? = scope_saved.clone();
 
                     let mut success = if let Some(key_plan) = &key_plan {
@@ -1239,7 +2030,7 @@ impl Interpreter {
         })
     }
 
-    fn apply_with_modifiers(&mut self, stmt: &LiteralStmt) -> Result<(Option<State>, bool)> {
+    fn apply_with_modifiers_impl(&mut self, stmt: &LiteralStmt) -> Result<(Option<State>, bool)> {
         if !stmt.with_mods.is_empty() {
             // Save state;
             let with_document = self.with_document.clone();
@@ -1257,6 +2048,7 @@ impl Interpreter {
             let mut skip_exec = false;
             // Apply with modifiers.
             for wm in &stmt.with_mods {
+                self.consume_semantic_work()?;
                 let path = Parser::get_path_ref_components(&wm.refr)?;
                 let mut path: Vec<String> = path.iter().map(|s| s.text().to_string()).collect();
 
@@ -1315,6 +2107,13 @@ impl Interpreter {
                             // Function replaced by value.
                             self.with_functions
                                 .insert(target, FunctionModifier::Value(v));
+                        }
+                        Err(error)
+                            if error
+                                .downcast_ref::<crate::EvaluationBudgetError>()
+                                .is_some() =>
+                        {
+                            return Err(error);
                         }
                         _ => {
                             // Function replaced by another function.
@@ -1392,6 +2191,30 @@ impl Interpreter {
         }
     }
 
+    fn apply_with_modifiers(&mut self, stmt: &LiteralStmt) -> Result<(Option<State>, bool)> {
+        let rollback = if stmt.with_mods.is_empty() {
+            None
+        } else {
+            Some((
+                self.with_document.clone(),
+                self.input.clone(),
+                self.data.clone(),
+                self.processed.clone(),
+                self.processed_paths.clone(),
+                self.with_functions.clone(),
+                self.rule_values.clone(),
+            ))
+        };
+
+        match self.apply_with_modifiers_impl(stmt) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                self.restore_state(rollback)?;
+                Err(error)
+            }
+        }
+    }
+
     fn restore_state(&mut self, saved_state: Option<State>) -> Result<()> {
         if let Some(s) = saved_state {
             (
@@ -1408,6 +2231,7 @@ impl Interpreter {
     }
 
     fn eval_stmt(&mut self, stmt: &LiteralStmt, stmts: &[&LiteralStmt]) -> Result<bool> {
+        self.consume_semantic_work()?;
         let (saved_state, skip_exec) = self.apply_with_modifiers(stmt)?;
         let r = if !skip_exec {
             self.eval_stmt_impl(stmt, stmts)
@@ -1433,7 +2257,7 @@ impl Interpreter {
         loops: &[HoistedLoop],
     ) -> Result<bool> {
         self.memory_check()?;
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         if loops.is_empty() {
             if let Some((first_stmt, tail_stmts)) = stmts.split_first() {
                 // Evaluate the current statement whose loop expressions have been hoisted.
@@ -1462,7 +2286,7 @@ impl Interpreter {
             let (saved_state, _) = self.apply_with_modifiers(first_stmt)?;
 
             let collection_expr = Self::loop_collection_expr(loop_info).clone();
-            let loop_value = if let Expr::Call {
+            let loop_value_result = if let Expr::Call {
                 span, fcn, params, ..
             } = collection_expr.as_ref()
             {
@@ -1481,14 +2305,16 @@ impl Interpreter {
                 } else {
                     params.as_slice()
                 };
-                self.eval_call_impl(span, &collection_expr, fcn, params_slice)?
+                self.eval_call_impl(span, &collection_expr, fcn, params_slice)
             } else {
-                self.eval_expr(&collection_expr)?
+                self.eval_expr(&collection_expr)
             };
 
             // Restore with modifiers.
             // TODO: Delay this restore so that the stmt doesn't have to apply with modifiers again.
             self.restore_state(saved_state)?;
+            let loop_value = loop_value_result?;
+            self.charge_collection_setup()?;
 
             // If the loop's index variable h<as already been assigned a value
             // (this can happen if the same index is used for two different collections),
@@ -1503,6 +2329,7 @@ impl Interpreter {
                 match loop_value {
                     Value::Array(items) => {
                         for item in items.iter() {
+                            self.charge_iteration_value(item)?;
                             self.memory_check()?;
                             self.set_loop_var_value(loop_target_expr, item.clone())?;
 
@@ -1583,6 +2410,7 @@ impl Interpreter {
             match loop_value {
                 Value::Array(items) => {
                     for (idx, v) in items.iter().enumerate() {
+                        self.charge_iteration_value(v)?;
                         self.memory_check()?;
                         self.set_loop_var_value(loop_target_expr, v.clone())?;
 
@@ -1604,7 +2432,8 @@ impl Interpreter {
                     self.remove_loop_var_value(loop_target_expr);
                 }
                 Value::Set(items) => {
-                    for v in items.iter() {
+                    for v in items.iter_sorted() {
+                        self.charge_iteration_value(v)?;
                         self.memory_check()?;
                         self.set_loop_var_value(loop_target_expr, v.clone())?;
 
@@ -1624,7 +2453,8 @@ impl Interpreter {
                     self.remove_loop_var_value(loop_target_expr);
                 }
                 Value::Object(obj) => {
-                    for (k, v) in obj.iter() {
+                    for (k, v) in obj.iter_sorted() {
+                        self.charge_iteration_entry(k, v)?;
                         self.memory_check()?;
                         self.set_loop_var_value(loop_target_expr, v.clone())?;
                         // For objects, index is key.
@@ -1659,7 +2489,7 @@ impl Interpreter {
     }
 
     fn eval_rule_ref(&mut self, rule_refr: &ExprRef) -> Result<Vec<Value>> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         let mut comps = vec![];
         let mut expr = rule_refr;
         loop {
@@ -1793,7 +2623,7 @@ impl Interpreter {
     }
 
     fn eval_output_expr_in_loop(&mut self, loops: &[HoistedLoop]) -> Result<bool> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         if loops.is_empty() {
             let (key_expr, output_expr) = self.get_exprs_from_context()?;
 
@@ -1882,9 +2712,11 @@ impl Interpreter {
                     let key = self.eval_expr(&ke)?;
                     let value = self.eval_expr(&oe)?;
 
-                    let ctx_mut = self.get_current_context_mut()?;
                     if key != Value::Undefined && value != Value::Undefined {
-                        let map = ctx_mut.value.as_object_mut()?;
+                        self.consume_semantic_work_n(2)?;
+                        self.charge_value_structure(&key)?;
+                        self.charge_value_structure(&value)?;
+                        let map = self.get_current_context_mut()?.value.as_object_mut()?;
                         match map.get(&key) {
                             Some(pv) if *pv != value => {
                                 let span = ke.span();
@@ -1903,6 +2735,7 @@ impl Interpreter {
                             _ => map.insert(key, value),
                         };
                     } else {
+                        let ctx_mut = self.get_current_context_mut()?;
                         match &ctx_mut.value {
                             Value::Object(_) => (),
                             _ => ctx_mut.value = Value::Undefined,
@@ -1911,9 +2744,9 @@ impl Interpreter {
                 }
                 (None, Some(oe)) => {
                     let output = self.eval_expr(&oe)?;
-                    let ctx_mut = self.get_current_context_mut()?;
                     if output != Value::Undefined {
-                        match &mut ctx_mut.value {
+                        self.charge_iteration_value(&output)?;
+                        match &mut self.get_current_context_mut()?.value {
                             Value::Array(a) => {
                                 Rc::make_mut(a).push(output);
                             }
@@ -1922,10 +2755,13 @@ impl Interpreter {
                             }
                             a => bail!("internal error: invalid context value {a}"),
                         }
-                    } else if !ctx_mut.is_compr {
-                        match &ctx_mut.value {
-                            Value::Set(_) => (),
-                            _ => ctx_mut.value = Value::Undefined,
+                    } else {
+                        let ctx_mut = self.get_current_context_mut()?;
+                        if !ctx_mut.is_compr {
+                            match &ctx_mut.value {
+                                Value::Set(_) => (),
+                                _ => ctx_mut.value = Value::Undefined,
+                            }
                         }
                     }
                 }
@@ -1970,21 +2806,26 @@ impl Interpreter {
             .ok_or_else(|| anyhow!("internal error: expected loop info"))?;
         let mut result = false;
         let loop_target_expr = Self::loop_assignment_expr(loop_info);
-        match self.eval_expr(Self::loop_collection_expr(loop_info))? {
+        let loop_value = self.eval_expr(Self::loop_collection_expr(loop_info))?;
+        self.charge_collection_setup()?;
+        match loop_value {
             Value::Array(items) => {
                 for v in items.iter() {
+                    self.charge_iteration_value(v)?;
                     self.set_loop_var_value(loop_target_expr, v.clone())?;
                     result = self.eval_output_expr_in_loop(loop_tail)? || result;
                 }
             }
             Value::Set(items) => {
-                for v in items.iter() {
+                for v in items.iter_sorted() {
+                    self.charge_iteration_value(v)?;
                     self.set_loop_var_value(loop_target_expr, v.clone())?;
                     result = self.eval_output_expr_in_loop(loop_tail)? || result;
                 }
             }
             Value::Object(obj) => {
-                for (_, v) in obj.iter() {
+                for (k, v) in obj.iter_sorted() {
+                    self.charge_iteration_entry(k, v)?;
                     self.set_loop_var_value(loop_target_expr, v.clone())?;
                     result = self.eval_output_expr_in_loop(loop_tail)? || result;
                 }
@@ -2020,7 +2861,7 @@ impl Interpreter {
     }
 
     fn eval_output_expr(&mut self) -> Result<bool> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // Evaluate output expression after all the statements have been executed.
 
         let (key_expr, output_expr) = self.get_exprs_from_context()?;
@@ -2151,7 +2992,7 @@ impl Interpreter {
     }
 
     fn eval_query(&mut self, query: &Ref<Query>) -> Result<bool> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // Execute the query in a new scope
         self.scopes.push(Scope::new());
         let order_indices = {
@@ -2235,7 +3076,7 @@ impl Interpreter {
     }
 
     fn eval_array(&mut self, items: &Vec<ExprRef>) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         let mut array = Vec::new();
 
         for item in items {
@@ -2251,7 +3092,7 @@ impl Interpreter {
     }
 
     fn eval_object(&mut self, fields: &Vec<(Span, ExprRef, ExprRef)>) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         let mut object = BTreeMap::new();
 
         for (_, key, value) in fields {
@@ -2274,7 +3115,7 @@ impl Interpreter {
     }
 
     fn eval_set(&mut self, items: &Vec<ExprRef>) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         let mut set = BTreeSet::new();
 
         for item in items {
@@ -2294,7 +3135,7 @@ impl Interpreter {
         value: &ExprRef,
         collection: &ExprRef,
     ) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         let value = self.eval_expr(value)?;
         let collection = self.eval_expr(collection)?;
 
@@ -2302,37 +3143,56 @@ impl Interpreter {
             Value::Array(array) => {
                 if let Some(key) = key {
                     let key = self.eval_expr(key)?;
-                    collection[&key] == value
+                    let candidate = &collection[&key];
+                    self.charge_comparison(candidate, &value)?;
+                    candidate == &value
                 } else {
-                    array.contains(&value)
+                    self.charge_collection_setup()?;
+                    let mut found = false;
+                    for candidate in array.iter() {
+                        self.consume_semantic_work()?;
+                        self.charge_comparison(candidate, &value)?;
+                        if candidate == &value {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
                 }
             }
             Value::Object(object) => {
                 if let Some(key) = key {
                     let key = self.eval_expr(key)?;
-                    collection[&key] == value
+                    self.consume_semantic_work_n(self.btree_lookup_projection(&key, object.len()))?;
+                    let candidate = &collection[&key];
+                    self.charge_comparison(candidate, &value)?;
+                    candidate == &value
                 } else {
-                    object.values().any(|item| *item == value)
+                    self.charge_collection_setup()?;
+                    let mut found = false;
+                    for (_entry_key, candidate) in object.iter_sorted() {
+                        self.consume_semantic_work_n(2)?;
+                        self.charge_comparison(candidate, &value)?;
+                        if candidate == &value {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
                 }
             }
-            Value::Set(set) => {
-                if key.is_some() {
-                    false
-                } else {
-                    set.contains(&value)
-                }
+            Value::Set(set) if key.is_none() => {
+                self.consume_semantic_work_n(self.btree_lookup_projection(&value, set.len()))?;
+                set.contains(&value)
             }
-            _ => {
-                false
-                //bail!(collection_expr.span().error("collection must be array, object or set"));
-            }
+            _ => false,
         };
 
         Ok(Value::Bool(result))
     }
 
     fn eval_array_compr(&mut self, term: &ExprRef, query: &Ref<Query>) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // Push new context
         self.contexts.push(Context {
             output_expr: Some(term.clone()),
@@ -2351,7 +3211,7 @@ impl Interpreter {
     }
 
     fn eval_set_compr(&mut self, term: &ExprRef, query: &Ref<Query>) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // Push new context
         self.contexts.push(Context {
             output_expr: Some(term.clone()),
@@ -2374,7 +3234,7 @@ impl Interpreter {
         value: &ExprRef,
         query: &Ref<Query>,
     ) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // Push new context
         self.contexts.push(Context {
             key_expr: Some(key.clone()),
@@ -2478,16 +3338,31 @@ impl Interpreter {
         params: &[ExprRef],
         args: Vec<Value>,
     ) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // If any argument is undefined, then the call is undefined.
         if args.iter().any(|a| a == &Value::Undefined) {
             return Ok(Value::Undefined);
         }
 
+        if Self::is_type_introspection(name) {
+            self.consume_semantic_work_n(u64::try_from(args.len()).unwrap_or(u64::MAX))?;
+        } else {
+            self.charge_values_reference(&args)?;
+        }
+        if self.evaluation_budget.is_limited() {
+            let projected = Self::builtin_work_projection(name, &args)
+                .ok_or_else(|| anyhow!("builtin `{name}` has no deterministic work estimator"))?;
+            self.consume_semantic_work_n(projected)?;
+        }
+
         let cache = builtins::must_cache(name);
         if let Some(cached_key) = &cache {
-            if let Some(v) = self.builtins_cache.get(&(cached_key, args.clone())) {
-                return Ok(v.clone());
+            if let Some(value) = self
+                .builtins_cache
+                .get(&(cached_key, args.clone()))
+                .cloned()
+            {
+                return self.charge_value_reference(value);
             }
         }
 
@@ -2508,6 +3383,8 @@ impl Interpreter {
             }
             Err(e) => Err(e)?,
         };
+
+        self.charge_value_structure(&v)?;
 
         // Handle trace function.
         // TODO: with modifier.
@@ -2625,7 +3502,7 @@ impl Interpreter {
         fcn: &ExprRef,
         params: &[ExprRef],
     ) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // Return generated values of walk builtin.
         if let Some(v) = self.get_loop_var_value(expr)? {
             return Ok(v.clone());
@@ -2687,11 +3564,19 @@ impl Interpreter {
                     // process default functions later.
                     (&empty, self.module.clone())
                 }
-                // Look up extension.
-                else if let Some(ext) = self.extensions.get_mut(&selected_fcn_path) {
-                    extension = Some(ext);
+                // Extensions and print have no declared deterministic estimator.
+                else if self.extensions.contains_key(&selected_fcn_path) {
+                    if self.evaluation_budget.is_limited() {
+                        bail!(
+                            "extension `{selected_fcn_path}` has no deterministic work estimator"
+                        );
+                    }
+                    extension = self.extensions.get_mut(&selected_fcn_path);
                     (&empty, None)
                 } else if selected_fcn_path == "print" {
+                    if self.evaluation_budget.is_limited() {
+                        bail!("builtin `print` has no deterministic work estimator");
+                    }
                     return self.eval_print(span, params, param_values);
                 }
                 // Look up builtin function.
@@ -2830,6 +3715,13 @@ impl Interpreter {
                     // resolve paths through the wrong module's imports when
                     // the error is swallowed below in non-strict mode.
                     self.set_current_module(prev_module)?;
+                    if e.downcast_ref::<crate::EvaluationBudgetError>().is_some() {
+                        self.scopes = scopes;
+                        if let Some(saved) = &with_functions_saved {
+                            self.with_functions = saved.clone();
+                        }
+                        return Err(e);
+                    }
                     errors.push(e);
                     self.scopes = scopes;
                     continue;
@@ -2906,6 +3798,16 @@ impl Interpreter {
                         if let Rule::Default { value, .. } = rule.as_ref() {
                             match self.eval_expr(value) {
                                 Ok(v) => results.push(v),
+                                Err(e)
+                                    if e.downcast_ref::<crate::EvaluationBudgetError>()
+                                        .is_some() =>
+                                {
+                                    self.scopes = scopes;
+                                    if let Some(saved) = &with_functions_saved {
+                                        self.with_functions = saved.clone();
+                                    }
+                                    return Err(e);
+                                }
                                 Err(e) => errors.push(e),
                             }
                         }
@@ -2931,6 +3833,11 @@ impl Interpreter {
         }
 
         // all defined values should be the equal to the same value that should be returned
+        for pair in results.windows(2) {
+            if let [lhs, rhs] = pair {
+                self.charge_comparison(lhs, rhs)?;
+            }
+        }
         if results.windows(2).any(|w| matches!(w, [a, b] if a != b)) {
             return Err(span.source.error(
                 span.line,
@@ -2954,7 +3861,7 @@ impl Interpreter {
         extra_arg: Option<ExprRef>,
         allow_return_arg: bool,
     ) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // TODO: global var check; interop with `some var`
         if extra_arg.is_some() {
             let (last_param, arg_prefix) = params
@@ -2986,6 +3893,7 @@ impl Interpreter {
                 }
             } else {
                 let expected = self.eval_expr(last_param)?;
+                self.charge_comparison(&value, &expected)?;
                 Ok(Value::Bool(value == expected))
             }
         } else {
@@ -3004,7 +3912,7 @@ impl Interpreter {
     }
 
     fn ensure_module_evaluated(&mut self, path: String) -> Result<()> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         for module in self.compiled_policy.modules.clone().iter().cloned() {
             if Some(&module) == self.module.as_ref() {
                 // Prevent cyclic evaluation.
@@ -3048,7 +3956,7 @@ impl Interpreter {
     }
 
     fn ensure_rule_evaluated(&mut self, path: String) -> Result<()> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         let mut matched = false;
         if let Some(rules) = self.compiled_policy.rules.get(&path) {
             matched = true;
@@ -3229,7 +4137,7 @@ impl Interpreter {
     }
 
     fn eval_expr(&mut self, expr: &ExprRef) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         #[cfg(feature = "coverage")]
         if self.enable_coverage {
             let span = expr.span();
@@ -3410,7 +4318,7 @@ impl Interpreter {
         span: &Span,
         bodies: &[RuleBody],
     ) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         let n_scopes = self.scopes.len();
         // Independent bodies of a partial (object/set) rule each contribute
         // keys/members. Bodies introduced by `else`, however, are mutually
@@ -3731,7 +4639,7 @@ impl Interpreter {
     }
 
     pub fn eval_default_rule(&mut self, rule: &Ref<Rule>) -> Result<()> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // Skip reprocessing rule.
         if self.processed.contains(rule) {
             return Ok(());
@@ -3805,7 +4713,7 @@ impl Interpreter {
     /// Evaluate a default rule and return the resulting value for compiler consumers.
     #[cfg(feature = "rvm")]
     pub fn eval_default_rule_for_compiler(&mut self, rule_path: &str) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         self.input = Value::Undefined;
         self.data = Value::Undefined;
         self.ensure_loop_var_values_capacity();
@@ -3899,7 +4807,7 @@ impl Interpreter {
     }
 
     fn eval_rule_impl(&mut self, module: &Ref<Module>, rule: &Ref<Rule>) -> Result<()> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         match rule.as_ref() {
             Rule::Spec {
                 span,
@@ -3928,7 +4836,9 @@ impl Interpreter {
                                 )?;
                             }
                         } else if is_set {
-                            if let Ok(mut comps) = self.eval_rule_ref(refr) {
+                            if let Some(mut comps) =
+                                Self::propagate_budget_error(self.eval_rule_ref(refr))?
+                            {
                                 let mut full_path = package_components;
                                 full_path.append(&mut comps);
                                 self.update_rule_value(span, full_path, Value::new_set(), true)?;
@@ -3936,7 +4846,9 @@ impl Interpreter {
                         } else if is_object {
                             // Fetch the rule, ignoring the key.
                             if let Expr::RefBrack { refr, .. } = refr.as_ref() {
-                                if let Ok(mut comps) = self.eval_rule_ref(refr) {
+                                if let Some(mut comps) =
+                                    Self::propagate_budget_error(self.eval_rule_ref(refr))?
+                                {
                                     let mut full_path = package_components;
                                     full_path.append(&mut comps);
                                     self.update_rule_value(
@@ -3998,7 +4910,7 @@ impl Interpreter {
     }
 
     pub fn eval_rule(&mut self, module: &Ref<Module>, rule: &Ref<Rule>) -> Result<()> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         // Set current module index
         self.current_module_index = self.find_module_index(module);
 
@@ -4057,7 +4969,7 @@ impl Interpreter {
         query_schedule: Schedule,
         enable_tracing: bool,
     ) -> Result<QueryResults> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         self.traces = match enable_tracing {
             true => Some(vec![]),
             false => None,
@@ -4565,7 +5477,7 @@ impl Interpreter {
     }
 
     pub fn eval_rule_in_path(&mut self, path: String) -> Result<Value> {
-        self.check_execution_time()?;
+        self.check_execution_limits()?;
         if !self.compiled_policy.rule_paths.contains(&path) {
             bail!("not a valid rule path");
         }

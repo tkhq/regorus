@@ -67,6 +67,23 @@ pub enum Number {
 
 #[verus_verify]
 impl Number {
+    /// Number of bytes needed to represent this number's magnitude.
+    ///
+    /// Integer magnitudes use their significant binary bytes, including one byte for zero.
+    /// Floating-point values use their fixed eight-byte representation.
+    pub(crate) fn magnitude_byte_len(&self) -> u64 {
+        match self {
+            Number::UInt(value) => {
+                u64::from((u64::BITS - value.leading_zeros()).max(1)).div_ceil(8)
+            }
+            Number::Int(value) => {
+                u64::from((u64::BITS - value.unsigned_abs().leading_zeros()).max(1)).div_ceil(8)
+            }
+            Number::Float(_) => 8,
+            Number::BigInt(value) => value.bits().max(1).div_ceil(8),
+        }
+    }
+
     #[verus_spec(result =>
         ensures
             result@ == NumberView::Integer(value@),
@@ -432,8 +449,17 @@ impl PartialEq for Number {
             axiom_f64_obeys_eq_spec();
         }
 
-        if let (Some(a), Some(b)) = (self.to_bigint_owned(), other.to_bigint_owned()) {
-            return a == b;
+        let integers_equal = match (self, other) {
+            (Number::BigInt(a), Number::BigInt(b)) => Some(a.as_ref() == b.as_ref()),
+            (Number::BigInt(a), b) => b.to_bigint_owned().map(|b| a.as_ref() == &b),
+            (a, Number::BigInt(b)) => a.to_bigint_owned().map(|a| &a == b.as_ref()),
+            (a, b) => a
+                .to_bigint_owned()
+                .zip(b.to_bigint_owned())
+                .map(|(a, b)| a == b),
+        };
+        if let Some(equal) = integers_equal {
+            return equal;
         }
 
         let a = self.to_f64_lossy();
@@ -470,8 +496,17 @@ impl Ord for Number {
             axiom_f64_obeys_partial_cmp_spec();
             axiom_bigint_obeys_cmp_spec();
         }
-        if let (Some(a), Some(b)) = (self.to_bigint_owned(), other.to_bigint_owned()) {
-            return a.cmp(&b);
+        let integer_order = match (self, other) {
+            (Number::BigInt(a), Number::BigInt(b)) => Some(a.as_ref().cmp(b.as_ref())),
+            (Number::BigInt(a), b) => b.to_bigint_owned().map(|b| a.as_ref().cmp(&b)),
+            (a, Number::BigInt(b)) => a.to_bigint_owned().map(|a| a.cmp(b.as_ref())),
+            (a, b) => a
+                .to_bigint_owned()
+                .zip(b.to_bigint_owned())
+                .map(|(a, b)| a.cmp(&b)),
+        };
+        if let Some(order) = integer_order {
+            return order;
         }
 
         self.to_f64_lossy()
@@ -1675,6 +1710,20 @@ mod tests {
             .modulo(&Number::Int(-1))
             .expect("modulo should succeed");
         assert_eq!(remainder.as_i64(), Some(0));
+    }
+
+    #[test]
+    fn huge_bigint_comparisons_borrow_large_operands() {
+        let huge = Rc::new(BigInt::one() << 819_200_usize);
+        let equal = Rc::new(huge.as_ref().clone());
+        let (huge, equal, small) = (Number::BigInt(huge), Number::BigInt(equal), Number::Int(-1));
+        for _ in 0..4_096 {
+            assert_eq!(huge.cmp(&small), Ordering::Greater);
+            assert_ne!(huge, small);
+            assert_eq!(huge.cmp(&equal), Ordering::Equal);
+            assert_eq!(huge, equal);
+            core::hint::black_box((&huge, &equal));
+        }
     }
 
     #[test]

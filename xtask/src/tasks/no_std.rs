@@ -29,18 +29,40 @@ impl TestNoStdCommand {
         let workspace = workspace_root();
         let project_dir = workspace.join("tests/ensure_no_std");
 
-        let mut args = vec![
+        let mut interpreter_args = vec![
+            OsString::from("check"),
+            OsString::from("--package"),
+            OsString::from("regorus"),
+            OsString::from("--lib"),
+            OsString::from("--no-default-features"),
+            OsString::from("--features"),
+            OsString::from("opa-no-std"),
+            OsString::from("--target"),
+            OsString::from(&self.target),
+        ];
+        let mut harness_args = vec![
             OsString::from("build"),
             OsString::from("--target"),
             OsString::from(&self.target),
         ];
         if self.release {
-            args.push(OsString::from("--release"));
+            interpreter_args.push(OsString::from("--release"));
+            harness_args.push(OsString::from("--release"));
         }
         if self.frozen {
-            args.push(OsString::from("--frozen"));
+            interpreter_args.push(OsString::from("--frozen"));
+            harness_args.push(OsString::from("--frozen"));
         }
-        run_cargo_step(&project_dir, "cargo build (tests/ensure_no_std)", args)?;
+        run_cargo_step(
+            &workspace,
+            "cargo check (interpreter opa-no-std)",
+            interpreter_args,
+        )?;
+        run_cargo_step(
+            &project_dir,
+            "cargo build (tests/ensure_no_std)",
+            harness_args,
+        )?;
         Ok(())
     }
 }
