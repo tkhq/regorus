@@ -395,9 +395,11 @@ impl Interpreter {
         Ok(())
     }
 
-    // Projection stops after deterministic work exceeds this bound. Returning MAX makes any
-    // finite budget reject before projection itself can become an unbounded pre-budget traversal.
-    const STRUCTURE_PROJECTION_CAP: u64 = 65_536;
+    fn projection_cap(&self) -> u64 {
+        self.evaluation_budget
+            .remaining()
+            .map_or(u64::MAX, |remaining| remaining.saturating_add(1))
+    }
 
     fn value_structure_projection(root: &Value) -> u64 {
         Self::value_structure_projection_capped(root, u64::MAX)
@@ -409,84 +411,145 @@ impl Interpreter {
         while let Some(value) = pending.pop() {
             let units = match value {
                 Value::String(value) => {
-                    1_u64.saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX))
+                    1_u64.saturating_add(value.len().try_into().unwrap_or(u64::MAX))
                 }
                 Value::Array(values) => {
-                    let units = 1_u64.saturating_add(values.len().try_into().unwrap_or(u64::MAX));
-                    if total.saturating_add(units) > cap {
-                        return u64::MAX;
-                    }
-                    pending.extend(values.iter());
-                    units
+                    1_u64.saturating_add(values.len().try_into().unwrap_or(u64::MAX))
                 }
                 Value::Set(values) => {
-                    let units = 1_u64.saturating_add(values.len().try_into().unwrap_or(u64::MAX));
-                    if total.saturating_add(units) > cap {
-                        return u64::MAX;
-                    }
-                    pending.extend(values.iter_sorted());
-                    units
+                    1_u64.saturating_add(values.len().try_into().unwrap_or(u64::MAX))
                 }
-                Value::Object(values) => {
-                    let units = 1_u64.saturating_add(
-                        u64::try_from(values.len())
-                            .unwrap_or(u64::MAX)
-                            .saturating_mul(2),
-                    );
-                    if total.saturating_add(units) > cap {
-                        return u64::MAX;
-                    }
-                    for (key, child_value) in values.iter_sorted() {
-                        pending.push(key);
-                        pending.push(child_value);
-                    }
-                    units
-                }
+                Value::Object(values) => 1_u64.saturating_add(
+                    u64::try_from(values.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(2),
+                ),
                 Value::Number(number) => 1_u64.saturating_add(number.magnitude_byte_len()),
                 Value::Null | Value::Bool(_) | Value::Undefined => 1,
             };
             total = total.saturating_add(units);
-            if total > cap {
-                return u64::MAX;
+            if total >= cap {
+                return cap;
+            }
+            match value {
+                Value::Array(values) => pending.extend(values.iter()),
+                Value::Set(values) => pending.extend(values.iter_sorted()),
+                Value::Object(values) => {
+                    for (key, child_value) in values.iter_sorted() {
+                        pending.push(key);
+                        pending.push(child_value);
+                    }
+                }
+                _ => {}
             }
         }
         total
     }
 
-    fn comparison_projection(lhs: &Value, rhs: &Value) -> u64 {
-        Self::value_structure_projection_capped(lhs, Self::STRUCTURE_PROJECTION_CAP)
-            .saturating_add(Self::value_structure_projection_capped(
-                rhs,
-                Self::STRUCTURE_PROJECTION_CAP,
-            ))
-            .max(1)
+    // Traverse corresponding structure only. This bounds lexicographic comparison by the smaller
+    // operand and stops before projection work can exceed a finite remaining budget.
+    fn comparison_projection(root_lhs: &Value, root_rhs: &Value, cap: u64) -> u64 {
+        let mut total = 0_u64;
+        let mut pending = vec![(root_lhs, root_rhs)];
+        while let Some((lhs, rhs)) = pending.pop() {
+            let units = match (lhs, rhs) {
+                (Value::String(lhs), Value::String(rhs)) => {
+                    1_u64.saturating_add(lhs.len().min(rhs.len()).try_into().unwrap_or(u64::MAX))
+                }
+                (Value::Number(lhs), Value::Number(rhs)) => {
+                    1_u64.saturating_add(lhs.magnitude_byte_len().min(rhs.magnitude_byte_len()))
+                }
+                (Value::Array(lhs), Value::Array(rhs)) => {
+                    let len = lhs.len().min(rhs.len());
+                    let units = 1_u64.saturating_add(len.try_into().unwrap_or(u64::MAX));
+                    if total.saturating_add(units) >= cap {
+                        return cap;
+                    }
+                    pending.extend(lhs.iter().zip(rhs.iter()));
+                    units
+                }
+                (Value::Set(lhs), Value::Set(rhs)) => {
+                    let len = lhs.len().min(rhs.len());
+                    let units = 1_u64.saturating_add(len.try_into().unwrap_or(u64::MAX));
+                    if total.saturating_add(units) >= cap {
+                        return cap;
+                    }
+                    pending.extend(lhs.iter_sorted().zip(rhs.iter_sorted()));
+                    units
+                }
+                (Value::Object(lhs), Value::Object(rhs)) => {
+                    let len = lhs.len().min(rhs.len());
+                    let units = 1_u64
+                        .saturating_add(u64::try_from(len).unwrap_or(u64::MAX).saturating_mul(2));
+                    if total.saturating_add(units) >= cap {
+                        return cap;
+                    }
+                    for ((lk, lv), (rk, rv)) in lhs.iter_sorted().zip(rhs.iter_sorted()) {
+                        pending.push((lk, rk));
+                        pending.push((lv, rv));
+                    }
+                    units
+                }
+                _ => 1,
+            };
+            total = total.saturating_add(units);
+            if total >= cap {
+                return cap;
+            }
+        }
+        total.max(1)
     }
 
     fn charge_comparison(&mut self, lhs: &Value, rhs: &Value) -> Result<()> {
-        self.consume_semantic_work_n(Self::comparison_projection(lhs, rhs))
+        self.consume_semantic_work_n(Self::comparison_projection(lhs, rhs, self.projection_cap()))
     }
 
-    fn btree_lookup_projection(needle: &Value, collection: &Value, len: usize) -> u64 {
-        // BTree comparator instrumentation is unavailable. At most every stored value can be
-        // compared, and the collection projection bounds every compared value.
-        u64::try_from(len)
-            .unwrap_or(u64::MAX)
-            .saturating_mul(Self::comparison_projection(needle, collection))
-            .max(1)
+    fn ceil_log2(len: usize) -> u64 {
+        if len <= 1 {
+            0
+        } else {
+            u64::from(usize::BITS.saturating_sub(len.saturating_sub(1).leading_zeros()))
+        }
     }
 
-    fn set_operator_projection(lhs: &Value, rhs: &Value) -> u64 {
-        let entries = match (lhs, rhs) {
-            (Value::Set(lhs), Value::Set(rhs)) => lhs.len().saturating_add(rhs.len()),
+    fn btree_comparison_count(len: usize) -> u64 {
+        Self::ceil_log2(len).saturating_add(1)
+    }
+
+    // Account for ceil(log2(n)) + 1 comparisons bounded by the lookup needle.
+    fn btree_lookup_projection(&self, needle: &Value, len: usize) -> u64 {
+        let bound = Self::value_structure_projection_capped(needle, self.projection_cap())
+            .saturating_add(1);
+        Self::btree_comparison_count(len).saturating_mul(bound)
+    }
+
+    fn set_operator_projection(&self, lhs: &Value, rhs: &Value) -> u64 {
+        let (lhs, rhs) = match (lhs, rhs) {
+            (Value::Set(lhs), Value::Set(rhs)) => (lhs, rhs),
             _ => return 1,
         };
-        let operands = Self::comparison_projection(lhs, rhs);
-        // Bound merge comparisons by all input entries, then reserve another operand-sized bound
-        // for the worst-case result. The actual result is charged again after construction.
-        u64::try_from(entries)
+        let cap = self.projection_cap();
+        let mut input = 2_u64
+            .saturating_add(lhs.len().try_into().unwrap_or(u64::MAX))
+            .saturating_add(rhs.len().try_into().unwrap_or(u64::MAX));
+        let mut max_element = 1_u64;
+        for value in lhs.iter_sorted().chain(rhs.iter_sorted()) {
+            let weight = Self::value_structure_projection_capped(value, cap);
+            input = input.saturating_add(weight);
+            max_element = max_element.max(weight.saturating_add(1));
+            if input >= cap {
+                return cap;
+            }
+        }
+        let entries = lhs.len().saturating_add(rhs.len());
+        // BTreeSet algebra exposes sorted adapters, but collecting the result may insert into a
+        // BTreeSet. Bound that path by logarithmic comparisons for every possible output entry.
+        let comparisons = u64::try_from(entries)
             .unwrap_or(u64::MAX)
-            .saturating_add(1)
-            .saturating_mul(operands)
+            .saturating_mul(Self::ceil_log2(entries.saturating_add(1)))
+            .saturating_mul(max_element);
+        // Input traversal plus a worst-case result equal to both inputs.
+        input.saturating_mul(2).saturating_add(comparisons).min(cap)
     }
 
     fn values_structure_projection(values: &[Value]) -> u64 {
@@ -1324,7 +1387,7 @@ impl Interpreter {
             return Ok(Value::Undefined);
         }
 
-        self.consume_semantic_work_n(Self::set_operator_projection(&lhs_value, &rhs_value))?;
+        self.consume_semantic_work_n(self.set_operator_projection(&lhs_value, &rhs_value))?;
         let result = match op {
             BinOp::Union => builtins::sets::union(lhs, rhs, lhs_value, rhs_value)?,
             BinOp::Intersection => builtins::sets::intersection(lhs, rhs, lhs_value, rhs_value)?,
@@ -1356,9 +1419,7 @@ impl Interpreter {
 
         match (op, &lhs_value, &rhs_value) {
             (ArithOp::Sub, Value::Set(_), _) | (ArithOp::Sub, _, Value::Set(_)) => {
-                self.consume_semantic_work_n(Self::set_operator_projection(
-                    &lhs_value, &rhs_value,
-                ))?;
+                self.consume_semantic_work_n(self.set_operator_projection(&lhs_value, &rhs_value))?;
                 let result = builtins::sets::difference(lhs, rhs, lhs_value, rhs_value)?;
                 self.charge_value_structure(&result)?;
                 Ok(result)
@@ -1510,11 +1571,7 @@ impl Interpreter {
                 if let Value::Object(obj) = value {
                     // Check that all required fields are present and match
                     for (key, field_plan) in field_plans {
-                        self.consume_semantic_work_n(Self::btree_lookup_projection(
-                            key,
-                            value,
-                            obj.len(),
-                        ))?;
+                        self.consume_semantic_work_n(self.btree_lookup_projection(key, obj.len()))?;
                         if let Some(field_value) = obj.get(key) {
                             if self.execute_destructuring_plan(field_plan, field_value)?
                                 != Value::from(true)
@@ -1533,11 +1590,9 @@ impl Interpreter {
                                 return Ok(Value::Undefined);
                             }
 
-                            self.consume_semantic_work_n(Self::btree_lookup_projection(
-                                &key_value,
-                                value,
-                                obj.len(),
-                            ))?;
+                            self.consume_semantic_work_n(
+                                self.btree_lookup_projection(&key_value, obj.len()),
+                            )?;
                             if let Some(field_value) = obj.get(&key_value) {
                                 if self.execute_destructuring_plan(field_plan, field_value)?
                                     != Value::from(true)
@@ -3069,7 +3124,7 @@ impl Interpreter {
                     self.charge_collection_setup()?;
                     let mut found = false;
                     for candidate in array.iter() {
-                        self.charge_iteration_value(candidate)?;
+                        self.consume_semantic_work()?;
                         self.charge_comparison(candidate, &value)?;
                         if candidate == &value {
                             found = true;
@@ -3082,19 +3137,15 @@ impl Interpreter {
             Value::Object(object) => {
                 if let Some(key) = key {
                     let key = self.eval_expr(key)?;
-                    self.consume_semantic_work_n(Self::btree_lookup_projection(
-                        &key,
-                        &collection,
-                        object.len(),
-                    ))?;
+                    self.consume_semantic_work_n(self.btree_lookup_projection(&key, object.len()))?;
                     let candidate = &collection[&key];
                     self.charge_comparison(candidate, &value)?;
                     candidate == &value
                 } else {
                     self.charge_collection_setup()?;
                     let mut found = false;
-                    for (entry_key, candidate) in object.iter_sorted() {
-                        self.charge_iteration_entry(entry_key, candidate)?;
+                    for (_entry_key, candidate) in object.iter_sorted() {
+                        self.consume_semantic_work_n(2)?;
                         self.charge_comparison(candidate, &value)?;
                         if candidate == &value {
                             found = true;
@@ -3105,11 +3156,7 @@ impl Interpreter {
                 }
             }
             Value::Set(set) if key.is_none() => {
-                self.consume_semantic_work_n(Self::btree_lookup_projection(
-                    &value,
-                    &collection,
-                    set.len(),
-                ))?;
+                self.consume_semantic_work_n(self.btree_lookup_projection(&value, set.len()))?;
                 set.contains(&value)
             }
             _ => false,

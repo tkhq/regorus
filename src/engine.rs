@@ -160,8 +160,9 @@ impl Engine {
     /// References and cache hits charge shared-value cloning rather than the full parent. Builtins
     /// charge argument references, operation-specific preflight work, and full result structure.
     /// Number weights include binary magnitude bytes, and arithmetic is precharged from magnitudes.
-    /// Comparisons use capped deep projections; membership charges scans or conservative tree work.
-    /// Set union, intersection, and difference precharge comparison and result-allocation bounds.
+    /// Comparisons project corresponding structure up to the smaller operand and stop at the
+    /// current remaining budget plus one. BTree lookup uses a logarithmic comparison bound. Set
+    /// operators precharge input traversal, comparator work, and worst-case result allocation.
     /// A budgeted builtin or extension without a declared estimator is rejected before dispatch.
     /// Compound
     /// and nested operations reach multiple checkpoints and share one top-level budget. The

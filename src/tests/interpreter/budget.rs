@@ -19,6 +19,14 @@ fn engine_with_policy(policy: &str) -> Result<Engine> {
     Ok(engine)
 }
 
+fn budgeted_work(policy: &str, input: Value, limit: u64) -> Result<u64> {
+    let mut engine = engine_with_policy(policy)?;
+    engine.set_input(input);
+    engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit });
+    engine.eval_rule("data.budget.answer".to_string())?;
+    Ok(engine.evaluation_metrics().consumed)
+}
+
 fn budget_error(error: &anyhow::Error) -> EvaluationBudgetError {
     *error
         .downcast_ref::<EvaluationBudgetError>()
@@ -545,6 +553,39 @@ fn repeated_large_equality_is_rejected_by_capped_projection() -> Result<()> {
         .eval_rule("data.budget.answer".to_string())
         .expect_err("deep equality must exhaust before comparing");
     assert_eq!(budget_error(&error).limit, 100_000);
+
+    let mut payable = engine_with_policy("package budget\nanswer := input == input\n")?;
+    payable.set_input(Value::from("x".repeat(8 * 1024 * 1024)));
+    payable.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 20_000_000 });
+    assert_eq!(
+        payable.eval_rule("data.budget.answer".to_string())?,
+        Value::Bool(true)
+    );
+    Ok(())
+}
+
+#[test]
+fn unequal_large_values_and_small_needles_remain_payable() -> Result<()> {
+    let large = Value::from("y".repeat(100 * 1024));
+    assert!(
+        budgeted_work(
+            "package budget\nanswer := input == \"x\"\n",
+            large.clone(),
+            1_000,
+        )? < 1_000
+    );
+
+    let policy = "package budget\nanswer := \"x\" in input\n";
+    let array = Value::from_array(core::iter::repeat_n(large.clone(), 8).collect());
+    let object = Value::from_map((0..8).map(|i| (Value::from(i), large.clone())).collect());
+    let set = Value::from_set(
+        (0..8)
+            .map(|i| Value::from(format!("{i}{}", "y".repeat(100 * 1024))))
+            .collect(),
+    );
+    for collection in [array, object, set] {
+        assert!(budgeted_work(policy, collection, 1_000)? < 1_000);
+    }
     Ok(())
 }
 
@@ -652,12 +693,23 @@ fn set_membership_bounds_btree_comparisons_deterministically() -> Result<()> {
     )?;
     assert_eq!(present, absent);
 
-    let mut engine = engine_with_policy(policy)?;
+    for size in [1_000, 33_000] {
+        let work = budgeted_work(
+            policy,
+            set_membership_input(size, Value::from(-1)),
+            1_000_000,
+        )?;
+        assert!(work < 1_000_000, "{size}-element lookup cost {work}");
+    }
+
+    let repeated =
+        "package budget\nanswer := [i | i := numbers.range(0, 1999)[_]; -1 in input.values]\n";
+    let mut engine = engine_with_policy(repeated)?;
     engine.set_input(set_membership_input(100_000, Value::from(-1)));
     engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 100_000 });
     engine
         .eval_rule("data.budget.answer".to_string())
-        .expect_err("large BTree membership must exhaust before lookup");
+        .expect_err("repeated adversarial BTree lookups must exhaust");
     Ok(())
 }
 
@@ -701,7 +753,8 @@ fn set_operator_input(size: usize) -> Value {
 fn set_operators_preflight_work_and_result_allocation() -> Result<()> {
     for operator in ["|", "&", "-"] {
         let policy = format!("package budget\nanswer := input.left {operator} input.right\n");
-        measured_work(&policy, "data.budget.answer", set_operator_input(4))?;
+        let work = budgeted_work(&policy, set_operator_input(1_000), 1_000_000)?;
+        assert!(work < 1_000_000, "{operator} cost {work}");
 
         let mut engine = engine_with_policy(&policy)?;
         engine.set_input(set_operator_input(100_000));
