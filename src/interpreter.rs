@@ -375,11 +375,82 @@ impl Interpreter {
         Ok(total)
     }
 
-    fn charge_values_structure(&mut self, values: &[Value]) -> Result<u64> {
-        values.iter().try_fold(0_u64, |total, value| {
-            self.charge_value_structure(value)
-                .map(|units| total.saturating_add(units))
+    fn reference_weight(value: &Value) -> u64 {
+        match value {
+            Value::Number(number) => 1_u64.saturating_add(number.magnitude_byte_len()),
+            _ => 1,
+        }
+    }
+
+    fn charge_value_reference(&mut self, value: Value) -> Result<Value> {
+        self.consume_semantic_work_n(Self::reference_weight(&value))?;
+        Ok(value)
+    }
+
+    fn charge_values_reference(&mut self, values: &[Value]) -> Result<()> {
+        let units = values.iter().fold(0_u64, |total, value| {
+            total.saturating_add(Self::reference_weight(value))
+        });
+        self.consume_semantic_work_n(units)?;
+        Ok(())
+    }
+
+    fn value_structure_projection(root: &Value) -> u64 {
+        let mut total = 0_u64;
+        let mut pending = vec![root];
+        while let Some(value) = pending.pop() {
+            total = total.saturating_add(match value {
+                Value::String(value) => {
+                    1_u64.saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX))
+                }
+                Value::Array(values) => {
+                    pending.extend(values.iter());
+                    1_u64.saturating_add(u64::try_from(values.len()).unwrap_or(u64::MAX))
+                }
+                Value::Set(values) => {
+                    pending.extend(values.iter_sorted());
+                    1_u64.saturating_add(u64::try_from(values.len()).unwrap_or(u64::MAX))
+                }
+                Value::Object(values) => {
+                    for (key, child_value) in values.iter_sorted() {
+                        pending.push(key);
+                        pending.push(child_value);
+                    }
+                    1_u64.saturating_add(
+                        u64::try_from(values.len())
+                            .unwrap_or(u64::MAX)
+                            .saturating_mul(2),
+                    )
+                }
+                Value::Number(number) => 1_u64.saturating_add(number.magnitude_byte_len()),
+                Value::Null | Value::Bool(_) | Value::Undefined => 1,
+            });
+        }
+        total
+    }
+
+    fn values_structure_projection(values: &[Value]) -> u64 {
+        values.iter().fold(0_u64, |total, value| {
+            total.saturating_add(Self::value_structure_projection(value))
         })
+    }
+
+    // Collection accounting is 1 unit for setup, then 1 + element weight for each visited
+    // array/set element, or 2 + key/value weights for each visited object entry. A complete
+    // traversal equals the structural weight, while early exit pays only for visited structure.
+    fn charge_collection_setup(&mut self) -> Result<()> {
+        self.consume_semantic_work()
+    }
+
+    fn charge_iteration_value(&mut self, value: &Value) -> Result<()> {
+        self.consume_semantic_work()?;
+        self.charge_value_structure(value).map(|_| ())
+    }
+
+    fn charge_iteration_entry(&mut self, key: &Value, value: &Value) -> Result<()> {
+        self.consume_semantic_work_n(2)?;
+        self.charge_value_structure(key)?;
+        self.charge_value_structure(value).map(|_| ())
     }
 
     fn range_projection(args: &[Value], step_index: Option<usize>) -> u64 {
@@ -592,24 +663,95 @@ impl Interpreter {
         }
     }
 
-    fn builtin_work_projection(name: &str, args: &[Value], argument_work: u64) -> Option<u64> {
-        let linear = argument_work.max(1);
-        let quadratic = linear.saturating_mul(linear);
+    // Rust regex search is O(pattern × haystack). Add pattern² compilation and
+    // operation-specific output bounds; every operation saturates on overflow.
+    fn regex_projection(name: &str, args: &[Value]) -> u64 {
+        let length = |index| {
+            args.get(index)
+                .and_then(|value| match value {
+                    Value::String(value) => Some(u64::try_from(value.len()).unwrap_or(u64::MAX)),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        };
+        if name == "regex.template_match" {
+            let template = length(0);
+            return template
+                .saturating_mul(template.saturating_add(length(1)))
+                .saturating_add(1);
+        }
+        let (pattern, haystack, replacement) = if name == "regex.replace" {
+            (length(1), length(0), length(2))
+        } else {
+            (length(0), length(1), 0)
+        };
+        let compile = pattern
+            .saturating_mul(pattern)
+            .saturating_add(pattern)
+            .saturating_add(1);
+        let search = pattern.max(1).saturating_mul(haystack);
+        let output = match name {
+            "regex.find_all_string_submatch_n" => search
+                .saturating_add(haystack)
+                .saturating_add(pattern)
+                .saturating_add(4),
+            "regex.find_n" | "regex.split" => haystack.saturating_mul(2).saturating_add(3),
+            "regex.replace" => haystack
+                .saturating_add(1)
+                .saturating_mul(replacement.saturating_add(pattern).saturating_add(2)),
+            _ => 1,
+        };
+        compile.saturating_add(search).saturating_add(output)
+    }
+
+    fn builtin_work_projection(name: &str, args: &[Value]) -> Option<u64> {
+        let linear = || Self::values_structure_projection(args).max(1);
+        let quadratic = || linear().saturating_mul(linear());
         Some(match name {
+            "count" => match args.first() {
+                Some(Value::String(value)) => u64::try_from(value.len()).unwrap_or(u64::MAX),
+                Some(Value::Array(value)) => u64::try_from(value.len())
+                    .unwrap_or(u64::MAX)
+                    .max(1)
+                    .ilog2()
+                    .saturating_add(1)
+                    .into(),
+                Some(Value::Set(value)) => u64::try_from(value.len())
+                    .unwrap_or(u64::MAX)
+                    .max(1)
+                    .ilog2()
+                    .saturating_add(1)
+                    .into(),
+                Some(Value::Object(value)) => u64::try_from(value.len())
+                    .unwrap_or(u64::MAX)
+                    .max(1)
+                    .ilog2()
+                    .saturating_add(1)
+                    .into(),
+                _ => 1,
+            },
+            "object.get" => args.get(1).map_or(1, Self::value_structure_projection),
             "numbers.range" => Self::range_projection(args, None),
             "numbers.range_step" => Self::range_projection(args, Some(2)),
             "net.cidr_expand" => Self::cidr_expand_projection(args),
             "azure.policy.fn.range" => Self::azure_range_projection(args),
             "azure.policy.fn.pad_left" => Self::azure_pad_left_projection(args),
-            "replace" | "regex.replace" => Self::replacement_projection(args),
-            "split" | "regex.split" | "azure.policy.fn.split" => linear.saturating_mul(2),
-            "sprintf" => Self::sprintf_projection(args, linear),
+            "replace" => Self::replacement_projection(args),
+            "split" | "azure.policy.fn.split" => linear().saturating_mul(2),
+            "regex.find_all_string_submatch_n"
+            | "regex.find_n"
+            | "regex.is_valid"
+            | "regex.match"
+            | "regex.replace"
+            | "regex.split"
+            | "regex.template_match" => Self::regex_projection(name, args),
+            "sprintf" => Self::sprintf_projection(args, linear()),
             "format_int" => Self::number_format_projection(args),
             "bits.lsh" | "bits.rsh" => Self::shift_projection(args),
             "to_number" | "units.parse" | "units.parse_bytes" => {
-                Self::decimal_exponent_projection(args, linear)
+                Self::decimal_exponent_projection(args, linear())
             }
-            "concat" | "array.concat" | "azure.policy.fn.join" => quadratic,
+            "concat" | "array.concat" | "azure.policy.fn.join" => quadratic(),
             "base64.decode"
             | "base64.encode"
             | "base64url.decode"
@@ -629,12 +771,11 @@ impl Interpreter {
             | "azure.policy.fn.string"
             | "azure.policy.fn.uri"
             | "azure.policy.fn.uri_component"
-            | "azure.policy.fn.uri_component_to_string" => linear.saturating_mul(8),
-            "walk" | "graph.reachable" | "yaml.marshal" => quadratic,
+            | "azure.policy.fn.uri_component_to_string" => linear().saturating_mul(8),
+            "walk" | "graph.reachable" | "yaml.marshal" => quadratic(),
             "array.reverse"
             | "array.slice"
             | "indexof_n"
-            | "regex.find_n"
             | "object.filter"
             | "object.keys"
             | "object.remove"
@@ -653,12 +794,11 @@ impl Interpreter {
             | "azure.policy.fn.items"
             | "azure.policy.fn.skip"
             | "azure.policy.fn.take"
-            | "azure.policy.fn.union" => quadratic,
+            | "azure.policy.fn.union" => quadratic(),
             "abs"
             | "ceil"
             | "floor"
             | "round"
-            | "count"
             | "max"
             | "min"
             | "product"
@@ -682,12 +822,7 @@ impl Interpreter {
             | "lower"
             | "net.cidr_contains"
             | "net.cidr_is_valid"
-            | "object.get"
             | "object.subset"
-            | "regex.globs_match"
-            | "regex.is_valid"
-            | "regex.match"
-            | "regex.template_match"
             | "semver.compare"
             | "semver.is_valid"
             | "startswith"
@@ -744,7 +879,7 @@ impl Interpreter {
             | "azure.policy.get_parameter"
             | "azure.policy.if"
             | "azure.policy.logic_all"
-            | "azure.policy.logic_any" => quadratic,
+            | "azure.policy.logic_any" => quadratic(),
             // External I/O, runtime, schema, random, potentially exponential expansion, and test
             // builtins do not have safe deterministic projections from their arguments. Budgeted
             // evaluation rejects them.
@@ -1033,13 +1168,15 @@ impl Interpreter {
         loop {
             if let Some(v) = self.get_loop_var_value(expr)? {
                 path.reverse();
-                return Ok(Self::get_value_chained(v.clone(), &path[..]));
+                let value = Self::get_value_chained(v.clone(), &path[..]);
+                return self.charge_value_reference(value);
             }
             match expr.as_ref() {
                 // Stop path collection upon encountering the leading variable.
                 Expr::Var { span, .. } => {
                     path.reverse();
-                    return self.lookup_var(span, &path[..], false);
+                    let value = self.lookup_var(span, &path[..], false)?;
+                    return self.charge_value_reference(value);
                 }
                 // Accumulate chained . field accesses.
                 Expr::RefDot { refr, field, .. } => {
@@ -1088,12 +1225,15 @@ impl Interpreter {
                             let index = index.to_string();
                             v = obj[index].clone();
                         }
-                        return Ok(Self::get_value_chained(v, &path[..]));
+                        let value = Self::get_value_chained(v, &path[..]);
+                        return self.charge_value_reference(value);
                     }
                 },
                 _ => {
                     path.reverse();
-                    return Ok(Self::get_value_chained(self.eval_expr(expr)?, &path[..]));
+                    let nested = self.eval_expr(expr)?;
+                    let value = Self::get_value_chained(nested, &path[..]);
+                    return self.charge_value_reference(value);
                 }
             }
         }
@@ -1183,10 +1323,11 @@ impl Interpreter {
             ..Context::default()
         });
         let mut r = true;
+        self.charge_collection_setup()?;
         match domain {
             Value::Array(a) => {
                 for (idx, v) in a.iter().enumerate() {
-                    self.consume_semantic_work()?;
+                    self.charge_iteration_value(v)?;
                     self.add_variable(&value.source_str(), v.clone())?;
                     if let Some(key) = key {
                         self.add_variable(&key.source_str(), Value::from(idx))?;
@@ -1198,8 +1339,8 @@ impl Interpreter {
                 }
             }
             Value::Set(s) => {
-                for v in s.iter() {
-                    self.consume_semantic_work()?;
+                for v in s.iter_sorted() {
+                    self.charge_iteration_value(v)?;
                     self.add_variable(&value.source_str(), v.clone())?;
                     if let Some(key) = key {
                         self.add_variable(&key.source_str(), v.clone())?;
@@ -1211,8 +1352,8 @@ impl Interpreter {
                 }
             }
             Value::Object(o) => {
-                for (k, v) in o.iter() {
-                    self.consume_semantic_work()?;
+                for (k, v) in o.iter_sorted() {
+                    self.charge_iteration_entry(k, v)?;
                     self.add_variable(&value.source_str(), v.clone())?;
                     if let Some(key) = key {
                         self.add_variable(&key.source_str(), k.clone())?;
@@ -1457,10 +1598,12 @@ impl Interpreter {
             bail!("internal error: missing binding plan for some..in expression");
         };
 
-        match self.eval_expr(collection)? {
+        let collection_value = self.eval_expr(collection)?;
+        self.charge_collection_setup()?;
+        match collection_value {
             Value::Array(a) => {
                 for (idx, value) in a.iter().enumerate() {
-                    self.consume_semantic_work()?;
+                    self.charge_iteration_value(value)?;
                     *self.current_scope_mut()? = scope_saved.clone();
 
                     let mut success = if let Some(key_plan) = &key_plan {
@@ -1497,8 +1640,8 @@ impl Interpreter {
                 }
             }
             Value::Set(s) => {
-                for value in s.iter() {
-                    self.consume_semantic_work()?;
+                for value in s.iter_sorted() {
+                    self.charge_iteration_value(value)?;
                     *self.current_scope_mut()? = scope_saved.clone();
 
                     let mut success = if let Some(key_plan) = &key_plan {
@@ -1535,8 +1678,8 @@ impl Interpreter {
             }
 
             Value::Object(o) => {
-                for (key, value) in o.iter() {
-                    self.consume_semantic_work()?;
+                for (key, value) in o.iter_sorted() {
+                    self.charge_iteration_entry(key, value)?;
                     *self.current_scope_mut()? = scope_saved.clone();
 
                     let mut success = if let Some(key_plan) = &key_plan {
@@ -2010,6 +2153,7 @@ impl Interpreter {
             // TODO: Delay this restore so that the stmt doesn't have to apply with modifiers again.
             self.restore_state(saved_state)?;
             let loop_value = loop_value_result?;
+            self.charge_collection_setup()?;
 
             // If the loop's index variable h<as already been assigned a value
             // (this can happen if the same index is used for two different collections),
@@ -2024,7 +2168,7 @@ impl Interpreter {
                 match loop_value {
                     Value::Array(items) => {
                         for item in items.iter() {
-                            self.consume_semantic_work()?;
+                            self.charge_iteration_value(item)?;
                             self.memory_check()?;
                             self.set_loop_var_value(loop_target_expr, item.clone())?;
 
@@ -2105,7 +2249,7 @@ impl Interpreter {
             match loop_value {
                 Value::Array(items) => {
                     for (idx, v) in items.iter().enumerate() {
-                        self.consume_semantic_work()?;
+                        self.charge_iteration_value(v)?;
                         self.memory_check()?;
                         self.set_loop_var_value(loop_target_expr, v.clone())?;
 
@@ -2127,8 +2271,8 @@ impl Interpreter {
                     self.remove_loop_var_value(loop_target_expr);
                 }
                 Value::Set(items) => {
-                    for v in items.iter() {
-                        self.consume_semantic_work()?;
+                    for v in items.iter_sorted() {
+                        self.charge_iteration_value(v)?;
                         self.memory_check()?;
                         self.set_loop_var_value(loop_target_expr, v.clone())?;
 
@@ -2148,8 +2292,8 @@ impl Interpreter {
                     self.remove_loop_var_value(loop_target_expr);
                 }
                 Value::Object(obj) => {
-                    for (k, v) in obj.iter() {
-                        self.consume_semantic_work()?;
+                    for (k, v) in obj.iter_sorted() {
+                        self.charge_iteration_entry(k, v)?;
                         self.memory_check()?;
                         self.set_loop_var_value(loop_target_expr, v.clone())?;
                         // For objects, index is key.
@@ -2407,9 +2551,11 @@ impl Interpreter {
                     let key = self.eval_expr(&ke)?;
                     let value = self.eval_expr(&oe)?;
 
-                    let ctx_mut = self.get_current_context_mut()?;
                     if key != Value::Undefined && value != Value::Undefined {
-                        let map = ctx_mut.value.as_object_mut()?;
+                        self.consume_semantic_work_n(2)?;
+                        self.charge_value_structure(&key)?;
+                        self.charge_value_structure(&value)?;
+                        let map = self.get_current_context_mut()?.value.as_object_mut()?;
                         match map.get(&key) {
                             Some(pv) if *pv != value => {
                                 let span = ke.span();
@@ -2428,6 +2574,7 @@ impl Interpreter {
                             _ => map.insert(key, value),
                         };
                     } else {
+                        let ctx_mut = self.get_current_context_mut()?;
                         match &ctx_mut.value {
                             Value::Object(_) => (),
                             _ => ctx_mut.value = Value::Undefined,
@@ -2436,9 +2583,9 @@ impl Interpreter {
                 }
                 (None, Some(oe)) => {
                     let output = self.eval_expr(&oe)?;
-                    let ctx_mut = self.get_current_context_mut()?;
                     if output != Value::Undefined {
-                        match &mut ctx_mut.value {
+                        self.charge_iteration_value(&output)?;
+                        match &mut self.get_current_context_mut()?.value {
                             Value::Array(a) => {
                                 Rc::make_mut(a).push(output);
                             }
@@ -2447,10 +2594,13 @@ impl Interpreter {
                             }
                             a => bail!("internal error: invalid context value {a}"),
                         }
-                    } else if !ctx_mut.is_compr {
-                        match &ctx_mut.value {
-                            Value::Set(_) => (),
-                            _ => ctx_mut.value = Value::Undefined,
+                    } else {
+                        let ctx_mut = self.get_current_context_mut()?;
+                        if !ctx_mut.is_compr {
+                            match &ctx_mut.value {
+                                Value::Set(_) => (),
+                                _ => ctx_mut.value = Value::Undefined,
+                            }
                         }
                     }
                 }
@@ -2495,24 +2645,26 @@ impl Interpreter {
             .ok_or_else(|| anyhow!("internal error: expected loop info"))?;
         let mut result = false;
         let loop_target_expr = Self::loop_assignment_expr(loop_info);
-        match self.eval_expr(Self::loop_collection_expr(loop_info))? {
+        let loop_value = self.eval_expr(Self::loop_collection_expr(loop_info))?;
+        self.charge_collection_setup()?;
+        match loop_value {
             Value::Array(items) => {
                 for v in items.iter() {
-                    self.consume_semantic_work()?;
+                    self.charge_iteration_value(v)?;
                     self.set_loop_var_value(loop_target_expr, v.clone())?;
                     result = self.eval_output_expr_in_loop(loop_tail)? || result;
                 }
             }
             Value::Set(items) => {
-                for v in items.iter() {
-                    self.consume_semantic_work()?;
+                for v in items.iter_sorted() {
+                    self.charge_iteration_value(v)?;
                     self.set_loop_var_value(loop_target_expr, v.clone())?;
                     result = self.eval_output_expr_in_loop(loop_tail)? || result;
                 }
             }
             Value::Object(obj) => {
-                for (_, v) in obj.iter() {
-                    self.consume_semantic_work()?;
+                for (k, v) in obj.iter_sorted() {
+                    self.charge_iteration_entry(k, v)?;
                     self.set_loop_var_value(loop_target_expr, v.clone())?;
                     result = self.eval_output_expr_in_loop(loop_tail)? || result;
                 }
@@ -3012,9 +3164,9 @@ impl Interpreter {
             return Ok(Value::Undefined);
         }
 
-        let argument_work = self.charge_values_structure(&args)?;
+        self.charge_values_reference(&args)?;
         if self.evaluation_budget.is_limited() {
-            let projected = Self::builtin_work_projection(name, &args, argument_work)
+            let projected = Self::builtin_work_projection(name, &args)
                 .ok_or_else(|| anyhow!("builtin `{name}` has no deterministic work estimator"))?;
             self.consume_semantic_work_n(projected)?;
         }
@@ -3026,8 +3178,7 @@ impl Interpreter {
                 .get(&(cached_key, args.clone()))
                 .cloned()
             {
-                self.charge_value_structure(&value)?;
-                return Ok(value);
+                return self.charge_value_reference(value);
             }
         }
 

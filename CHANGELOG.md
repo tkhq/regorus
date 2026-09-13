@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- *(interpreter)* Add a deterministic, `no_std`-compatible semantic-work budget shared by complete top-level evaluations, with typed limit errors, consumed-unit metrics, versioned magnitude-aware number charging, arithmetic and expanding-builtin preflight estimates, and default-deny handling for unestimated builtins and extensions.
+- *(interpreter)* Add a deterministic, `no_std`-compatible semantic-work budget shared by complete top-level evaluations, with typed limit errors, consumed-unit metrics, versioned incremental collection and magnitude-aware number charging, arithmetic and regex/expanding-builtin preflight estimates, and default-deny handling for unestimated builtins and extensions.
 
 ### Fixed
 

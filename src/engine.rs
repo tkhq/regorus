@@ -155,9 +155,11 @@ impl Engine {
     /// Units are consumed at deterministic semantic checkpoints: expression and statement
     /// dispatch, queries and rule bodies, rule and function calls, builtin and extension
     /// calls, compound-expression helpers, collection assembly, each loop or comprehension
-    /// iteration, each `with` modifier, and uncached virtual-document work. Builtins also
-    /// charge structural argument and result weights plus a preflight projection. Number weights
-    /// include binary magnitude bytes, and arithmetic is precharged from operand magnitudes.
+    /// iteration, each `with` modifier, and uncached virtual-document work. Collection traversal
+    /// charges setup once and then each visited element or entry, including nested structure.
+    /// References and cache hits charge shared-value cloning rather than the full parent. Builtins
+    /// charge argument references, operation-specific preflight work, and full result structure.
+    /// Number weights include binary magnitude bytes, and arithmetic is precharged from magnitudes.
     /// A budgeted builtin or extension without a declared estimator is rejected before dispatch.
     /// Compound
     /// and nested operations reach multiple checkpoints and share one top-level budget. The

@@ -7,8 +7,12 @@ use core::fmt;
 ///
 /// Version 1 charges one unit for scalar values, plus a number's binary magnitude bytes or a
 /// string's UTF-8 bytes. It charges one plus the element count plus child weights for arrays and
-/// sets, and one plus twice the entry count plus key and value weights for objects. Builtins also
-/// charge argument weights, a declared preflight projection, and the actual result weight.
+/// sets, and one plus twice the entry count plus key and value weights for objects. Collection
+/// iteration charges one setup unit, then one slot plus the visited element weight, or two slots
+/// plus visited key and value weights. References and cache hits charge their cloned scalar or one
+/// shared-value unit instead of the full parent. Builtins charge argument-reference weights, a
+/// declared preflight projection, and the actual result weight. Regex projections saturatingly
+/// charge pattern² compilation, pattern × haystack search, and operation-specific output bounds.
 /// Arithmetic charges a magnitude-based projection before evaluation. A budgeted call is rejected
 /// before dispatch when its builtin or extension has no declared estimator. Version 1 describes
 /// the unreleased accounting contract and can change until its first release.

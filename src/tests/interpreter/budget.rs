@@ -318,13 +318,13 @@ answer := count(input)
 #[test]
 fn bigint_magnitude_increases_structural_work() -> Result<()> {
     let mut small_engine =
-        engine_with_policy("package budget\nanswer := count([18446744073709551616])\n")?;
+        engine_with_policy("package budget\nanswer := sum([18446744073709551616])\n")?;
     small_engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 100_000 });
     small_engine.eval_rule("data.budget.answer".to_string())?;
     let small = small_engine.evaluation_metrics().consumed;
 
     let mut large_engine = engine_with_policy(
-        "package budget\nanswer := count([340282366920938463463374607431768211456])\n",
+        "package budget\nanswer := sum([340282366920938463463374607431768211456])\n",
     )?;
     large_engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 100_000 });
     large_engine.eval_rule("data.budget.answer".to_string())?;
@@ -388,5 +388,133 @@ answer := custom_repeat("x")
         .to_string()
         .contains("extension `custom_repeat` has no deterministic work estimator"));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+fn grant_input(count: usize, disabled: Option<usize>) -> Result<Value> {
+    let grants = (0..count)
+        .map(|index| {
+            format!(
+                r#"{{"id":"grant-{index}","enabled":{},"scope":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","nested":{{"role":"reader","level":1}}}}"#,
+                disabled != Some(index)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Value::from_json_str(&format!(r#"{{"grants":[{grants}]}}"#))
+}
+
+fn measured_work(policy: &str, rule: &str, input: Value) -> Result<u64> {
+    let mut engine = engine_with_policy(policy)?;
+    engine.set_input(input);
+    engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 20_000_000 });
+    let first = engine.eval_rule(rule.to_string())?;
+    let work = engine.evaluation_metrics().consumed;
+    assert_eq!(engine.eval_rule(rule.to_string())?, first);
+    assert_eq!(engine.evaluation_metrics().consumed, work);
+    Ok(work)
+}
+
+#[test]
+fn dynamic_collection_iteration_is_linear_and_deterministic() -> Result<()> {
+    let cases = [
+        ("array", r#"[g | g := input.grants[_]]"#),
+        ("set", r#"{g | g := input.grants[_]}"#),
+        ("object", r#"{g.id: g | g := input.grants[_]}"#),
+    ];
+    for (name, expression) in cases {
+        let policy = format!("package budget\nanswer := {expression}\n");
+        let work32 = measured_work(&policy, "data.budget.answer", grant_input(32, None)?)?;
+        let work64 = measured_work(&policy, "data.budget.answer", grant_input(64, None)?)?;
+        assert!(work64 > work32, "{name} work must be monotonic");
+        assert!(
+            work64 < work32.saturating_mul(3),
+            "{name} work must remain linear"
+        );
+        assert!(work64 < 1_000_000, "{name} must remain practical");
+    }
+    Ok(())
+}
+
+#[test]
+fn every_charges_only_visited_nested_entries() -> Result<()> {
+    let policy = r#"
+package budget
+answer if { every grant in input.grants { grant.enabled } }
+"#;
+    let early = measured_work(policy, "data.budget.answer", grant_input(64, Some(0))?)?;
+    let late = measured_work(policy, "data.budget.answer", grant_input(64, Some(63))?)?;
+    let no_match = measured_work(policy, "data.budget.answer", grant_input(64, None)?)?;
+    assert!(early < late);
+    assert!(late <= no_match.saturating_add(100));
+    assert!(no_match < 1_000_000);
+    Ok(())
+}
+
+#[test]
+fn repeated_cached_rule_collection_references_remain_linear() -> Result<()> {
+    let policy = r#"
+package budget
+facts := [g | g := input.grants[_]]
+first := [g.id | g := data.budget.facts[_]]
+second := [g.nested.role | g := data.budget.facts[_]]
+counts := [count(data.budget.facts) | _ := data.budget.facts[_]]
+answer := [data.budget.first, data.budget.second, data.budget.counts]
+"#;
+    let four_items = measured_work(policy, "data.budget.answer", grant_input(4, None)?)?;
+    let work32 = measured_work(policy, "data.budget.answer", grant_input(32, None)?)?;
+    let work64 = measured_work(policy, "data.budget.answer", grant_input(64, None)?)?;
+    assert!(four_items < 1_000_000);
+    assert!(work64 > work32);
+    assert!(work64 < work32.saturating_mul(3));
+    assert!(work64 < 1_000_000);
+    Ok(())
+}
+
+#[test]
+fn regex_work_scales_with_pattern_times_haystack() -> Result<()> {
+    let policy = "package budget\nanswer := regex.match(`needle`, input)\n";
+    let mut work = Vec::new();
+    for size in [1024, 4096, 200_000] {
+        work.push(measured_work(
+            policy,
+            "data.budget.answer",
+            Value::from("x".repeat(size)),
+        )?);
+    }
+    assert!(work[0] < work[1] && work[1] < work[2]);
+    assert!(work[2] < work[1].saturating_mul(60));
+    assert!(work[2] < 10_000_000);
+    Ok(())
+}
+
+#[test]
+fn regex_family_estimators_cover_unicode_captures_and_invalid_patterns() -> Result<()> {
+    let cases = [
+        r#"regex.match("é+", "éé")"#,
+        r#"regex.is_valid("[")"#,
+        r#"regex.find_n("a.", "aé ab", -1)"#,
+        r#"regex.find_all_string_submatch_n("(a)(.)", "aé ab", -1)"#,
+        r#"regex.split("[, ]+", "a,β c")"#,
+        r#"regex.replace("aé ab", "a(.)", "$1$1")"#,
+        r#"regex.template_match("urn:{[a-z]+}", "urn:value", "{", "}")"#,
+    ];
+    for call in cases {
+        let policy = format!("package budget\nanswer := {call}\n");
+        measured_work(&policy, "data.budget.answer", Value::Null)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn regex_replacement_expansion_is_preflighted() -> Result<()> {
+    let mut engine =
+        engine_with_policy("package budget\nanswer := regex.replace(input, `x?`, `0123456789`)\n")?;
+    engine.set_input(Value::from("x".repeat(200_000)));
+    engine.set_evaluation_budget_config(EvaluationBudgetConfig { limit: 1_000_000 });
+    let error = engine
+        .eval_rule("data.budget.answer".to_string())
+        .expect_err("replacement expansion must be rejected before dispatch");
+    assert_eq!(budget_error(&error).limit, 1_000_000);
     Ok(())
 }
